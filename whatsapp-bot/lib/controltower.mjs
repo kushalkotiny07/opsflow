@@ -651,6 +651,11 @@ export async function drainOutbound(send, { limit = 5 } = {}) {
       try { mentions = Array.isArray(row.mentions) ? row.mentions : (row.mentions ? JSON.parse(row.mentions) : null); } catch { mentions = null; }
       const waId = await send(row.targetJid, signText(row.text), { quoted, media, mentions: mentions?.length ? mentions : null });
       await taskosQuery(`UPDATE wa_outbound SET status='SENT', "sentWaMsgId"=$2, "sentAt"=now() WHERE id=$1`, [row.id, waId || null]);
+      await taskosQuery(
+        `UPDATE lab_communications SET status='SENT', "sentAt"=COALESCE("sentAt", now()), "updatedAt"=now()
+         WHERE "waOutboundId"=$1 AND status='QUEUED'`,
+        [row.id]
+      );
       sent++;
     } catch (e) {
       await taskosQuery(`UPDATE wa_outbound SET status='FAILED', error=$2 WHERE id=$1`, [row.id, (e?.message || String(e)).slice(0, 300)]);

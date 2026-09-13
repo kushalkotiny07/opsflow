@@ -7,6 +7,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getSessionFromRequest } from "@/lib/auth/session";
 import prisma from "@/lib/db/client";
 import { RosterStatus } from "@prisma/client";
+import { computeRosterStatus } from "@/lib/roster/availability";
 
 export async function PATCH(request: NextRequest) {
   const user = await getSessionFromRequest(request);
@@ -53,6 +54,25 @@ export async function GET(request: NextRequest) {
   const entry = await prisma.dailyRoster.findFirst({
     where: { teamMemberId: teamMember.id, date: { gte: date, lt: nextDay } },
   });
+  if (entry) return NextResponse.json({ status: entry.status, note: entry.note ?? null, source: "self" });
 
-  return NextResponse.json({ status: entry?.status ?? "OFF", note: entry?.note ?? null });
+  // No self-declared entry for today. Falling back to a hard-coded "OFF" told
+  // agents they were off shift while the engine — which reads WeeklySchedule +
+  // RosterException via computeRosterStatus, never daily_rosters — was busy
+  // assigning them work. Compute the same way the engine and GET /api/team do,
+  // so all three agree.
+  const [schedule, exception] = await Promise.all([
+    prisma.weeklySchedule.findFirst({
+      where: { teamMemberId: teamMember.id, dayOfWeek: now.getDay() },
+    }),
+    prisma.rosterException.findFirst({
+      where: { teamMemberId: teamMember.id, date: { gte: date, lt: nextDay } },
+    }),
+  ]);
+
+  return NextResponse.json({
+    status: computeRosterStatus(schedule, exception, now),
+    note: exception?.note ?? null,
+    source: "schedule",
+  });
 }

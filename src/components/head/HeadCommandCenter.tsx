@@ -77,6 +77,16 @@ interface SourceStat {
   openTasks: number;
 }
 
+interface NonApiWorkflowStats {
+  waitingForLabConfirmation: number;
+  accepted: number;
+  rescheduleRequested: number;
+  rejected: number;
+  escalated: number;
+  pendingReminderActions: number;
+  pendingEscalationActions: number;
+}
+
 interface DashboardData {
   stats: Stats;
   sourceStats: SourceStat[];
@@ -84,6 +94,7 @@ interface DashboardData {
   team: TeamMember[];
   recentAlerts: Alert[];
   lastPollAt: string | null;
+  nonApiWorkflowStats?: NonApiWorkflowStats;
 }
 
 /**
@@ -229,6 +240,23 @@ function SourceHealthCard({ refreshKey }: { refreshKey: number }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function MetricChip({ label, value, tone }: { label: string; value: number; tone: "blue" | "green" | "amber" | "red" | "purple" }) {
+  const colorMap: Record<typeof tone, string> = {
+    blue: "text-blue-400",
+    green: "text-green-400",
+    amber: "text-amber-400",
+    red: "text-red-400",
+    purple: "text-purple-400",
+  };
+
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wider text-zinc-500">{label}</div>
+      <div className={`mt-1 text-lg font-semibold ${colorMap[tone]}`}>{value}</div>
     </div>
   );
 }
@@ -414,7 +442,7 @@ export default function HeadCommandCenter() {
     );
   }
 
-  const { stats, sourceStats = [], riskItems, team, recentAlerts, lastPollAt } = data;
+  const { stats, sourceStats = [], riskItems, team, recentAlerts, lastPollAt, nonApiWorkflowStats } = data;
   const visibleAlerts = recentAlerts.filter((a) => !dismissedAlerts.has(a.id));
 
   return (
@@ -643,6 +671,29 @@ export default function HeadCommandCenter() {
         {/* ── Source health card (W3) — replaces the prior plain
              source-chips strip. Adds cycle health + tasks-last-hour. */}
         <SourceHealthCard refreshKey={refreshKey} />
+
+        {nonApiWorkflowStats && (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3">
+            <div className="flex items-center justify-between gap-3 mb-3">
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-zinc-600 font-semibold">Non-API Labs</div>
+                <div className="text-sm font-medium text-zinc-200">Lab confirmation queue</div>
+              </div>
+              <span className="text-xs text-zinc-500">{nonApiWorkflowStats.waitingForLabConfirmation} awaiting response</span>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+              <MetricChip label="Waiting" value={nonApiWorkflowStats.waitingForLabConfirmation} tone="blue" />
+              <MetricChip label="Accepted" value={nonApiWorkflowStats.accepted} tone="green" />
+              <MetricChip label="Reschedule" value={nonApiWorkflowStats.rescheduleRequested} tone="amber" />
+              <MetricChip label="Rejected" value={nonApiWorkflowStats.rejected} tone="red" />
+              <MetricChip label="Escalated" value={nonApiWorkflowStats.escalated} tone="purple" />
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2 text-[10px] text-zinc-500">
+              <span className="rounded-full border border-zinc-700 bg-zinc-950/60 px-2 py-1">{nonApiWorkflowStats.pendingReminderActions} reminder due</span>
+              <span className="rounded-full border border-zinc-700 bg-zinc-950/60 px-2 py-1">{nonApiWorkflowStats.pendingEscalationActions} escalation due</span>
+            </div>
+          </div>
+        )}
 
         <div className="grid grid-cols-3 gap-5">
           {/* ── Risk Zone ── */}

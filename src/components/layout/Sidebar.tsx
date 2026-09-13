@@ -9,11 +9,19 @@ interface SidebarProps {
   user: AuthUser;
 }
 
+interface NavChild {
+  label: string;
+  href: string;
+}
+
 interface NavItem {
   label: string;
   href: string;
   icon: React.ReactNode;
   roles?: UserRole[];
+  // When present the row becomes a collapsible group: it no longer links
+  // anywhere itself, it expands to reveal these sub-routes.
+  children?: NavChild[];
 }
 
 const navItems: NavItem[] = [
@@ -136,6 +144,22 @@ const navItems: NavItem[] = [
     ),
   },
   {
+    label: "Provider Communication",
+    href: "/head/non-api-labs",
+    roles: ["OPS_HEAD"],
+    children: [
+      { label: "Lab Config", href: "/head/non-api-labs/lab-config" },
+      { label: "Task Rules", href: "/head/non-api-labs/task-rules" },
+      { label: "Templates", href: "/head/non-api-labs/templates" },
+      { label: "SLA Breaches", href: "/head/non-api-labs/breaches" },
+    ],
+    icon: (
+      <svg className="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M3 21h18M5 21V7l7-4 7 4v14M9 21v-5h6v5M9 9h.01M15 9h.01M9 12h.01M15 12h.01" />
+      </svg>
+    ),
+  },
+  {
     label: "Engine",
     href: "/head/engine",
     roles: ["OPS_HEAD"],
@@ -173,10 +197,23 @@ export default function Sidebar({ user }: SidebarProps) {
   const pathname = usePathname();
   const router = useRouter();
   const [loggingOut, setLoggingOut] = useState(false);
+  // Groups the user has explicitly toggled. Absent means "follow the route":
+  // a group opens on its own while one of its children is the active page.
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
 
   const visibleNav = navItems.filter(
     (item) => !item.roles || item.roles.includes(user.role as UserRole)
   );
+
+  // Exact-match the role-root routes ("/head", "/agent") so they don't also
+  // light up when the user is on a child route like /head/tasks or
+  // /agent/smart-view. Everything else uses prefix match so deep sub-pages
+  // still highlight their parent nav.
+  const EXACT_MATCH_ROUTES = new Set(["/head", "/agent"]);
+  const isActive = (href: string) =>
+    EXACT_MATCH_ROUTES.has(href)
+      ? pathname === href
+      : pathname === href || pathname.startsWith(href + "/");
 
   async function handleLogout() {
     setLoggingOut(true);
@@ -217,14 +254,58 @@ export default function Sidebar({ user }: SidebarProps) {
       {/* Nav */}
       <nav className="flex-1 px-2 py-3 space-y-0.5 overflow-y-auto">
         {visibleNav.map((item) => {
-          // Exact-match the role-root routes ("/head", "/agent") so they
-          // don't also light up when the user is on a child route like
-          // /head/tasks or /agent/smart-view. Everything else uses prefix
-          // match so deep sub-pages still highlight their parent nav.
-          const EXACT_MATCH_ROUTES = new Set(["/head", "/agent"]);
-          const active = EXACT_MATCH_ROUTES.has(item.href)
-            ? pathname === item.href
-            : pathname === item.href || pathname.startsWith(item.href + "/");
+          const active = isActive(item.href);
+
+          if (item.children) {
+            const expanded = openGroups[item.href] ?? active;
+            return (
+              <div key={item.href}>
+                <button
+                  type="button"
+                  onClick={() => setOpenGroups((prev) => ({ ...prev, [item.href]: !expanded }))}
+                  aria-expanded={expanded}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                    active
+                      ? "bg-blue-600/15 text-blue-400"
+                      : "text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800"
+                  }`}
+                >
+                  <span className={active ? "text-blue-400" : "text-zinc-500"}>{item.icon}</span>
+                  <span className="flex-1 text-left">{item.label}</span>
+                  <svg
+                    className={`w-3.5 h-3.5 shrink-0 transition-transform ${expanded ? "rotate-180" : ""}`}
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                  </svg>
+                </button>
+                {expanded && (
+                  <div className="mt-0.5 ml-5 pl-2.5 border-l border-zinc-800 space-y-0.5">
+                    {item.children.map((child) => {
+                      const childActive = isActive(child.href);
+                      return (
+                        <Link
+                          key={child.href}
+                          href={child.href}
+                          className={`block px-3 py-1.5 rounded-lg text-[13px] font-medium transition-colors ${
+                            childActive
+                              ? "bg-blue-600/15 text-blue-400"
+                              : "text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800"
+                          }`}
+                        >
+                          {child.label}
+                        </Link>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          }
+
           return (
             <Link
               key={item.href}

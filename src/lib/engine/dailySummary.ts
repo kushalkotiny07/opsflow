@@ -8,6 +8,8 @@ import prisma from "@/lib/db/client";
 import { AlertType, TaskStatus, UserRole } from "@prisma/client";
 import { sendWhatsAppMessage } from "@/lib/alerts/whatsapp";
 
+const DAILY_SUMMARY_TEMPLATE = "opsflow_daily_summary";
+
 export async function sendDailySummary(): Promise<void> {
   console.log("[DailySummary] Generating daily summary…");
 
@@ -74,6 +76,9 @@ export async function sendDailySummary(): Promise<void> {
   });
 
   // ── WhatsApp to Ops Heads ────────────────────────────────────────────────────
+  // {{1}} of opsflow_daily_summary — Meta places no limit on what text one
+  // placeholder carries, only on the template having a fixed slot count, so
+  // the whole digest goes in as a single parameter.
   const waMessage =
     `📊 *OpsFlow Daily Summary — ${dateLabel}*\n\n` +
     `Tasks Created: ${createdToday}\n` +
@@ -91,7 +96,7 @@ export async function sendDailySummary(): Promise<void> {
 
   for (const head of opsHeads) {
     if (head.phone) {
-      await sendWhatsAppMessage({ to: head.phone, body: waMessage }).catch((e) =>
+      await sendWhatsAppMessage({ to: head.phone, template: DAILY_SUMMARY_TEMPLATE, params: [waMessage] }).catch((e) =>
         console.error("[DailySummary] WhatsApp send failed:", e)
       );
     }

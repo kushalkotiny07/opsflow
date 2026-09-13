@@ -56,6 +56,33 @@ where the rule engine just has nothing to act on but the UI works.
 
 ## Alternative shapes
 
+### Dummy source data (no real LabStack needed)
+
+With `SOURCE_DATABASE_URL` blank the app runs but the rule engine has
+nothing to poll, so every board is empty. The `labstack-dummy` overlay adds
+a third container, `labstack-db`, shaped like the LabStack database OpsFlow
+reads and seeded from the "Labstacks orders" sheet — 215 orders, 210
+patients, 13 labs, 9 partner stores — then points the app at it:
+
+```bash
+npm run dummy:up      # = docker compose -f docker-compose.yml \
+                      #     -f docker-compose.labstack-dummy.yml up -d --build
+open http://localhost:3000
+```
+
+A poll cycle against it creates a few hundred tasks across the seeded HSC
+rules. Three companion seeds finish the environment — `npm run dummy:team`
+(agents, without which every task stays unassigned), `npm run dummy:labs`
+(Provider Communication pointed at real lab ids) and `npm run dummy:activity`
+(a partly-worked day, so the throughput metrics have something to read).
+
+The seed shifts the sheet's operating day onto the day you load it, so the
+orders sit inside the poller's `NOW() ± 10 days` appointment window. It then
+ages a day per day — `npm run dummy:realign` shifts it back onto today and
+rebuilds the tasks, which is the one command worth remembering.
+Host port is `5434`. Details, and the judgement calls made while
+transcribing the sheet, are in `docker/labstack-dummy/README.md`.
+
 ### External taskos DB (skip bundled Postgres)
 
 If you have an existing Postgres you want OpsFlow to use for `taskos`:

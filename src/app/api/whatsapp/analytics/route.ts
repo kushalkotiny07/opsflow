@@ -61,8 +61,11 @@ export async function GET(request: NextRequest) {
       count(*) FILTER (WHERE status = 'RESOLVED' AND "resolvedAt" > now() - interval '1 day') AS resolved_24h
     FROM wa_tickets`;
 
+  // `t` alias is required: OPEN is `t.status <> 'RESOLVED'`, so an unaliased
+  // FROM here made the whole endpoint 500 with 42P01 "missing FROM-clause
+  // entry for table t" — independent of how much WhatsApp data exists.
   const origins = await prisma.$queryRaw<Array<{ origin: string; n: bigint }>>`
-    SELECT origin, count(*) AS n FROM wa_tickets WHERE ${OPEN} GROUP BY 1`;
+    SELECT t.origin, count(*) AS n FROM wa_tickets t WHERE ${OPEN} GROUP BY 1`;
 
   const n = (v: bigint | undefined) => Number(v || 0);
   const list = (rows: Array<{ n: bigint } & Record<string, unknown>>, key: string) =>

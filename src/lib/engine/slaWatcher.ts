@@ -5,7 +5,12 @@
  */
 import prisma from "@/lib/db/client";
 import { TaskStatus, AlertType } from "@prisma/client";
-import { sendWhatsAppMessage, formatSlaBreachMessage } from "@/lib/alerts/whatsapp";
+import { sendWhatsAppMessage, slaBreachTemplateParams } from "@/lib/alerts/whatsapp";
+
+const SLA_BREACH_TEMPLATE = "opsflow_sla_breach";
+const ESCALATION_TEMPLATE = "opsflow_escalation";
+import { notifyProviderOfBreach, type BreachNotifyOutcome } from "@/lib/provider-comms/sla-breach";
+import { resolveLabIdsForOrders } from "@/lib/provider-comms/order-lab";
 
 const WARNING_MINUTES = 10; // warn when ≤10 min remain
 
@@ -23,8 +28,19 @@ export async function runSlaWatcher(): Promise<void> {
       id: true, escalationChainId: true, assignedToId: true,
       title: true, storeId: true, taskRuleId: true,
       entityId: true, orderType: true, slaDeadline: true,
+      // Needed by the provider breach alert (patient, appointment, lab name)
+      // and by the ops-head WhatsApp below, which used to re-query for it.
+      metadata: true,
     },
   });
+
+  // One batched source lookup for the whole run: tasks store the order id but
+  // not the lab id, and provider configs are keyed by lab. Empty when the
+  // source is unreachable, which simply means no provider alerts this cycle.
+  const labIdByOrder = breached.length > 0
+    ? await resolveLabIdsForOrders(breached.map((task) => task.entityId))
+    : new Map<number, number>();
+  const providerOutcomes: Record<string, number> = {};
 
   for (const task of breached) {
     await prisma.task.update({
@@ -74,27 +90,60 @@ export async function runSlaWatcher(): Promise<void> {
       ? await prisma.user.findUnique({ where: { id: task.assignedToId }, select: { name: true } })
       : null;
 
-    const taskMeta = await prisma.task.findUnique({
-      where: { id: task.id },
-      select: { entityId: true, metadata: true },
-    });
+    const taskMetadata = (task.metadata ?? null) as Record<string, unknown> | null;
 
     for (const head of opsHeads) {
       if (head.phone) {
-        const waBody = formatSlaBreachMessage({
-          taskTitle: task.title,
-          orderId: taskMeta?.entityId ?? 0,
-          patientName: (taskMeta?.metadata as Record<string, unknown>)?.patientName as string ?? "Patient",
-          assignedTo: assignedUser?.name ?? null,
+        // Sent via the approved opsflow_sla_breach template, not free text —
+        // see lib/alerts/whatsapp.ts for why a cold alert cannot be plain text.
+        await sendWhatsAppMessage({
+          to: head.phone,
+          template: SLA_BREACH_TEMPLATE,
+          params: slaBreachTemplateParams({
+            taskTitle: task.title,
+            orderId: task.entityId,
+            patientName: (taskMetadata?.patientName as string) ?? "Patient",
+            assignedTo: assignedUser?.name ?? null,
+          }),
+          taskId: task.id,
         });
-        await sendWhatsAppMessage({ to: head.phone, body: waBody, taskId: task.id });
       }
+    }
+
+    // ── Tell the provider ──────────────────────────────────────────
+    // The alert above goes inward, to the ops head. This one goes outward, to
+    // the lab that owes us the order — and unlike the confirmation ladder it
+    // is not restricted to NON_API labs, because a missed deadline is worth
+    // reporting however the order reached them.
+    const labId = labIdByOrder.get(task.entityId);
+    if (labId !== undefined) {
+      const outcome: BreachNotifyOutcome = await notifyProviderOfBreach({
+        taskId: task.id,
+        orderId: task.entityId,
+        labId,
+        taskTitle: task.title,
+        slaDeadline: task.slaDeadline ?? now,
+        breachedAt: now,
+        breachMinutes,
+        metadata: taskMetadata,
+      });
+      providerOutcomes[outcome] = (providerOutcomes[outcome] ?? 0) + 1;
+    } else {
+      providerOutcomes["no-lab"] = (providerOutcomes["no-lab"] ?? 0) + 1;
     }
 
     // Kick off escalation chain (level 1)
     if (task.escalationChainId) {
       await triggerEscalationChain(task.id, task.escalationChainId, now);
     }
+  }
+
+  // Counted rather than logged per task: "37 breaches, 4 queued, 30 no-config"
+  // is the line that tells you whether provider alerts are actually reaching
+  // anyone, and it is unreadable one line at a time on a busy run.
+  if (breached.length > 0) {
+    const summary = Object.entries(providerOutcomes).map(([k, v]) => `${k}=${v}`).join(" ");
+    console.info(`[SlaWatcher] ${breached.length} breach(es); provider alerts: ${summary}`);
   }
 
   // ── 2. Create SLA_WARNING alerts for tasks nearing deadline ───────
@@ -244,10 +293,11 @@ async function firePendingEscalations(now: Date): Promise<void> {
         select: { phone: true, name: true },
       });
       if (notifyUser?.phone && alert.task) {
-        const msg = `🔴 *Escalation L${escalationLevel}* — Task: "${alert.task.title}" (Order #${alert.task.entityId}) is SLA breached and needs attention. — OpsFlow`;
+        // opsflow_escalation params, in template order: level, task title, order id.
         await sendWhatsAppMessage({
           to: notifyUser.phone,
-          body: msg,
+          template: ESCALATION_TEMPLATE,
+          params: [String(escalationLevel), alert.task.title, String(alert.task.entityId)],
           taskId: alert.task.id,
         });
       }

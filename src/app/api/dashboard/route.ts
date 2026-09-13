@@ -163,6 +163,7 @@ export async function GET(request: NextRequest) {
     recentAlerts,
     lastPoll,
     sourceStats,
+    nonApiWorkflowStatsRow,
   ] = await Promise.all([
     // 1. Labstack active-order count via an approximate (instant) read
     //    from pg_class.reltuples instead of a real COUNT(*). The exact
@@ -293,6 +294,32 @@ export async function GET(request: NextRequest) {
         },
       },
     }),
+
+    prisma.$queryRaw<Array<{
+      waiting_for_lab_confirmation: bigint;
+      accepted: bigint;
+      reschedule_requested: bigint;
+      rejected: bigint;
+      escalated: bigint;
+      pending_reminder_actions: bigint;
+      pending_escalation_actions: bigint;
+    }>>`
+      SELECT
+        COUNT(*) FILTER (WHERE status = 'WAITING_FOR_LAB_CONFIRMATION') AS "waiting_for_lab_confirmation",
+        COUNT(*) FILTER (WHERE status = 'LAB_ACCEPTED') AS "accepted",
+        COUNT(*) FILTER (WHERE status = 'LAB_RESCHEDULE_REQUESTED') AS "reschedule_requested",
+        COUNT(*) FILTER (WHERE status = 'LAB_REJECTED') AS "rejected",
+        COUNT(*) FILTER (WHERE status = 'ESCALATED') AS "escalated",
+        COUNT(*) FILTER (
+          WHERE "status" = 'WAITING_FOR_LAB_CONFIRMATION'
+            AND "confirmationDeadline" <= ${now}
+        ) AS "pending_reminder_actions",
+        COUNT(*) FILTER (
+          WHERE "status" IN ('WAITING_FOR_LAB_CONFIRMATION', 'ESCALATED')
+            AND "escalationDeadline" <= ${now}
+        ) AS "pending_escalation_actions"
+      FROM "lab_communication_workflows"
+    `,
   ]);
 
   if (activeOrdersResult && activeOrdersResult.length > 0) {
@@ -373,6 +400,26 @@ export async function GET(request: NextRequest) {
     ),
   }));
 
+  const nonApiWorkflowStats = nonApiWorkflowStatsRow[0] ?? {
+    waiting_for_lab_confirmation: BigInt(0),
+    accepted: BigInt(0),
+    reschedule_requested: BigInt(0),
+    rejected: BigInt(0),
+    escalated: BigInt(0),
+    pending_reminder_actions: BigInt(0),
+    pending_escalation_actions: BigInt(0),
+  };
+
+  const shapedNonApiWorkflowStats: NonApiWorkflowStats = {
+    waitingForLabConfirmation: Number(nonApiWorkflowStats.waiting_for_lab_confirmation),
+    accepted: Number(nonApiWorkflowStats.accepted),
+    rescheduleRequested: Number(nonApiWorkflowStats.reschedule_requested),
+    rejected: Number(nonApiWorkflowStats.rejected),
+    escalated: Number(nonApiWorkflowStats.escalated),
+    pendingReminderActions: Number(nonApiWorkflowStats.pending_reminder_actions),
+    pendingEscalationActions: Number(nonApiWorkflowStats.pending_escalation_actions),
+  };
+
   return NextResponse.json({
     stats: {
       activeOrders,
@@ -393,6 +440,7 @@ export async function GET(request: NextRequest) {
     team,
     recentAlerts,
     lastPollAt: lastPoll?.finishedAt ?? null,
+    nonApiWorkflowStats: shapedNonApiWorkflowStats,
     // W4 — echoes the resolved range so the UI can label the affected
     // tiles ("Done Today" vs "Done This Shift" vs "Done This Week").
     range: { key: range, since: rangeStart.toISOString() },

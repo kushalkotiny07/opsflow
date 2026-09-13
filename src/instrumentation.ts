@@ -52,6 +52,19 @@ export async function register() {
     console.error("[Instrumentation] Failed to start legacy poller:", err);
   }
 
+  // ── 2b. Non-API lab communication tick ──────────────────────────────────────
+  // Deliberately its own loop rather than a step in the poll cycle: reminders
+  // and escalations only need primary-key lookups, so they must keep running
+  // when the replica is too contended for the poller's bulk scans. Uses
+  // polling-lock key 1001.
+  try {
+    const { startNonApiLabRunner } = await import("@/lib/non-api-labs/runner");
+    await startNonApiLabRunner();
+    console.log("[Instrumentation] Non-API lab communication tick started (every minute)");
+  } catch (err) {
+    console.error("[Instrumentation] Failed to start non-API lab tick:", err);
+  }
+
   // ── 3. Archive scheduler ─────────────────────────────────────────────────────
   try {
     const { initializeArchiveScheduler } = await import(

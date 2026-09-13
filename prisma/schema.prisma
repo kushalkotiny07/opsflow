@@ -863,31 +863,31 @@ model WaGroup {
 }
 
 model WaMessage {
-  id          String         @id @default(cuid())
-  waMsgId     String         @unique // WhatsApp message id → idempotent ingest
-  groupId     String
-  ticketId    String?
-  direction   WaMsgDirection @default(IN)
-  fromMe      Boolean        @default(false)
-  sender      String // pushName
-  senderJid   String? // participant jid/lid — used to match the LS team roster
-  text        String
-  mediaType   String? // image / document / etc.
-  ts          DateTime // message timestamp
-  replyToWaId String? // quoted message id (WhatsApp reply)
-  intent      String? // classifier output
-  orderIds    Int[]          @default([]) // VALIDATED canonical Order ids only
-  requestIds  Int[]          @default([]) // VALIDATED Request ids only
-  refIds      String[]       @default([]) // lab reference ids (BLR…/HYD…) seen in the text
-  idType      String? // provenance of the primary id: REF / ORDER / REQUEST / APPOINTMENT
-  idVia       String? // human trail, e.g. "appt 21877" or "request 15021"
-  ambiguousIds Int[]         @default([]) // bare numbers we would NOT guess (need clarification)
-  mediaPath   String? // stored media object key/path (images/docs)
-  mediaMime   String? // media mime type
-  ocrText     String? // extracted text from an image/doc
-  ocrJson     Json? // structured interpretation of the media
-  raw         Json?
-  createdAt   DateTime       @default(now())
+  id           String         @id @default(cuid())
+  waMsgId      String         @unique // WhatsApp message id → idempotent ingest
+  groupId      String
+  ticketId     String?
+  direction    WaMsgDirection @default(IN)
+  fromMe       Boolean        @default(false)
+  sender       String // pushName
+  senderJid    String? // participant jid/lid — used to match the LS team roster
+  text         String
+  mediaType    String? // image / document / etc.
+  ts           DateTime // message timestamp
+  replyToWaId  String? // quoted message id (WhatsApp reply)
+  intent       String? // classifier output
+  orderIds     Int[]          @default([]) // VALIDATED canonical Order ids only
+  requestIds   Int[]          @default([]) // VALIDATED Request ids only
+  refIds       String[]       @default([]) // lab reference ids (BLR…/HYD…) seen in the text
+  idType       String? // provenance of the primary id: REF / ORDER / REQUEST / APPOINTMENT
+  idVia        String? // human trail, e.g. "appt 21877" or "request 15021"
+  ambiguousIds Int[]          @default([]) // bare numbers we would NOT guess (need clarification)
+  mediaPath    String? // stored media object key/path (images/docs)
+  mediaMime    String? // media mime type
+  ocrText      String? // extracted text from an image/doc
+  ocrJson      Json? // structured interpretation of the media
+  raw          Json?
+  createdAt    DateTime       @default(now())
 
   group  WaGroup   @relation(fields: [groupId], references: [id], onDelete: Cascade)
   ticket WaTicket? @relation(fields: [ticketId], references: [id])
@@ -942,29 +942,29 @@ model WaCaseBrief {
 }
 
 model WaTicket {
-  id              String         @id @default(cuid())
-  groupId         String
-  storeId         Int?
-  origin          String         @default("CUSTOMER") // CUSTOMER query (CX group) | PROVIDER request (lab group)
-  status          WaTicketStatus @default(NEW)
-  orderId         Int?
-  requestId       Int?
-  entityKind      String? // ORDER | REQUEST | APPOINTMENT — the namespace the id was resolved to
-  idConfidence    String? // high | low — how sure the resolver is this is the right entity
-  idWarning       String? // staleness / contradiction note (e.g. "order delivered 238d before the chat")
-  idAlt           Json? // { kind, id } — the runner-up candidate, for a one-click switch
-  intent          String?
-  contextSnapshot Json? // order/request context captured from the replica
-  assignedToId    Int? // User.id (no FK, mirrors Task assignment pattern)
-  slaDueAt        DateTime?
-  firstMessageId  String?
-  firstResponseAt DateTime? // when our team first responded (native or console)
-  respondedVia    String? // "native" (WhatsApp app) | "console"
+  id                String         @id @default(cuid())
+  groupId           String
+  storeId           Int?
+  origin            String         @default("CUSTOMER") // CUSTOMER query (CX group) | PROVIDER request (lab group)
+  status            WaTicketStatus @default(NEW)
+  orderId           Int?
+  requestId         Int?
+  entityKind        String? // ORDER | REQUEST | APPOINTMENT — the namespace the id was resolved to
+  idConfidence      String? // high | low — how sure the resolver is this is the right entity
+  idWarning         String? // staleness / contradiction note (e.g. "order delivered 238d before the chat")
+  idAlt             Json? // { kind, id } — the runner-up candidate, for a one-click switch
+  intent            String?
+  contextSnapshot   Json? // order/request context captured from the replica
+  assignedToId      Int? // User.id (no FK, mirrors Task assignment pattern)
+  slaDueAt          DateTime?
+  firstMessageId    String?
+  firstResponseAt   DateTime? // when our team first responded (native or console)
+  respondedVia      String? // "native" (WhatsApp app) | "console"
   lastResponderName String? // team member who last responded
-  lastActivityAt  DateTime       @default(now())
-  resolvedAt      DateTime?
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
+  lastActivityAt    DateTime       @default(now())
+  resolvedAt        DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
 
   group    WaGroup      @relation(fields: [groupId], references: [id], onDelete: Cascade)
   messages WaMessage[]
@@ -1047,4 +1047,578 @@ model WaContact {
 
   @@index([phone])
   @@map("wa_contacts")
+}
+
+// ─────────────────────────────────────────────
+// NON-API LAB COMMUNICATION AUTOMATION (MVP)
+//
+// LabStack remains the source of truth for labs, orders, patients and
+// appointments. These records deliberately store the external ids and a
+// minimal order snapshot rather than duplicating source-domain tables.
+// ─────────────────────────────────────────────
+
+// ── SLA milestone breach (all labs, API and NON_API) ────────────────────
+// Deliberately keyed on the ORDER and the LAB, never on a communication
+// workflow: an API lab never has one, and this feature covers both.
+
+enum SlaMilestone {
+  ORDER_CONFIRMED
+  PHLEBO_ASSIGNED
+  SAMPLE_COLLECTED
+  SAMPLE_DELIVERED
+  REPORT_UPLOADED
+}
+
+// Which clock a milestone's deadline hangs off. Conflating these is the
+// dangerous bug in this feature, so the anchor is always explicit and stored.
+enum SlaAnchor {
+  ORDER_CREATED
+  APPOINTMENT_TIME
+  PREV_MILESTONE_COMPLETED
+}
+
+enum SlaBreachStatus {
+  ACTIVE
+  RESOLVED
+  CAPPED
+  CANCELLED
+}
+
+// A path step is either part of the timed sequence or a conditional breach
+// watcher. Breach steps never participate in sequence ordering — see the
+// comment on ProviderCommunicationRule.triggerKind.
+enum StepTriggerKind {
+  RELATIVE_DELAY
+  SLA_BREACH
+}
+
+enum LabIntegrationType {
+  API
+  NON_API
+}
+
+enum LabCommunicationWorkflowStatus {
+  WAITING_FOR_LAB_CONFIRMATION
+  LAB_ACCEPTED
+  LAB_RESCHEDULE_REQUESTED
+  LAB_REJECTED
+  ESCALATED
+  COMPLETED
+  CANCELLED
+}
+
+enum LabCommunicationChannel {
+  WHATSAPP
+}
+
+enum LabCommunicationType {
+  INITIAL_NOTIFICATION
+  REMINDER
+  ESCALATION
+  MANUAL_RESEND
+  // Fired by the SLA watcher when an OpsFlow task for the order breaches its
+  // deadline. Unlike the four above it is NOT part of the confirmation
+  // workflow — it applies to API labs too, which never run that workflow — so
+  // a SLA_BREACH row is the one kind that can carry a null workflowId.
+  SLA_BREACH
+}
+
+enum LabCommunicationStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  SUPPRESSED
+  ACTION_TAKEN
+}
+
+enum LabScheduledActionType {
+  SEND_REMINDER
+  ESCALATE
+}
+
+// Which clock a scheduled action hangs off. ORDER offsets are positive
+// (minutes after we first saw the order); APPOINTMENT offsets are negative
+// (minutes before the patient is due). See lib/non-api-labs/ladder.ts.
+enum LabScheduleAnchor {
+  ORDER
+  APPOINTMENT
+}
+
+enum LabScheduledActionStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  CANCELLED
+  FAILED
+  SUPPRESSED
+}
+
+enum LabProviderActionType {
+  ACCEPT
+  RESCHEDULE
+  REJECT
+}
+
+enum LabEscalationStatus {
+  OPEN
+  NOTIFIED
+  RESOLVED
+  CANCELLED
+}
+
+enum LabOrderEventType {
+  ORDER_DETECTED
+  WORKFLOW_STARTED
+  MESSAGE_QUEUED
+  MESSAGE_SENT
+  MESSAGE_DELIVERED
+  MESSAGE_READ
+  ACTION_LINK_OPENED
+  LAB_ACCEPTED
+  LAB_RESCHEDULE_REQUESTED
+  LAB_REJECTED
+  REMINDER_SCHEDULED
+  REMINDER_SENT
+  REMINDER_SUPPRESSED
+  ESCALATION_TRIGGERED
+  WORKFLOW_CANCELLED
+}
+
+// Editable message content. The renderer validates every {{variable}} before
+// enqueueing a message, so a broken template never silently sends malformed
+// operational information to a lab.
+model LabCommunicationTemplate {
+  id          String                  @id @default(cuid())
+  key         String                  @unique
+  name        String
+  channel     LabCommunicationChannel @default(WHATSAPP)
+  body        String
+  isActive    Boolean                 @default(true)
+  createdById Int?
+  updatedById Int?
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
+
+  @@index([channel, isActive])
+  @@map("lab_communication_templates")
+}
+
+// One provider-communication configuration per external LabStack lab. The
+// external Lab row itself is never written by OpsFlow.
+//
+// This used to describe NON_API labs only. It now covers both integration
+// types, because the two triggers it drives have different audiences:
+//
+//   confirmation ladder  NON_API only — an API lab already received the order
+//                        over the API, so asking it to accept/reschedule over
+//                        WhatsApp would be noise.
+//   SLA breach alert     both — "your order has blown its deadline" is worth
+//                        sending whichever way the order reached the lab.
+//
+// So an API lab's row is legitimate and useful even though it schedules no
+// ladder; see lib/provider-comms/sla-breach.ts.
+model NonApiLabConfig {
+  labId                       Int                @id
+  labName                     String
+  integrationType             LabIntegrationType @default(NON_API)
+  // Where messages to this provider go. Exactly one is needed:
+  //   waGroupJid     — a WhatsApp GROUP ("…@g.us"). Preferred: the provider's
+  //                    ops group, where a reply is visible to their whole desk.
+  //   whatsappNumber — a single handset, as a DM.
+  // A group target always routes through a wa_groups row so the gateway's
+  // per-group sendEnabled guard applies; see lib/non-api-labs/target.ts.
+  waGroupJid                  String?
+  whatsappNumber              String?
+  managerName                 String?
+  managerWhatsapp             String?
+  isActive                    Boolean            @default(true)
+  confirmationSlaMinutes      Int                @default(60)
+  reminderSlaMinutes          Int                @default(180)
+  escalationSlaMinutes        Int                @default(300)
+  initialTemplateKey          String             @default("NON_API_NEW_ORDER")
+  reminderTemplateKey         String             @default("NON_API_REMINDER")
+  escalationTemplateKey       String             @default("NON_API_ESCALATION")
+  appointmentTemplateKey      String             @default("NON_API_APPOINTMENT_REMINDER")
+  // Appointment-anchored reminders (T-24h/-2h/-30m/-10m) can be turned off per
+  // lab; the order clock always runs.
+  appointmentRemindersEnabled Boolean            @default(true)
+  // Minimum gap between two messages about the SAME order, across both clocks.
+  // Confirmation ladder only: breach alerts are capped per order instead, and
+  // lib/provider-comms/sla-breach.ts explains why applying this to them would
+  // suppress nearly every alert for a busy lab.
+  quietWindowMinutes          Int                @default(10)
+  // Message this lab when an OpsFlow task for one of its orders breaches SLA.
+  // Applies to API and NON_API labs alike; off by lab, not by integration type.
+  slaBreachAlertsEnabled      Boolean            @default(true)
+  slaBreachTemplateKey        String             @default("PROVIDER_SLA_BREACH")
+  // Breach alerts are per task, but one order can breach several task rules in
+  // a row. This caps how many reach the provider for a single order; further
+  // breaches are still recorded by the SLA watcher, just not re-sent.
+  slaBreachMaxPerOrder        Int                @default(2)
+  createdById                 Int?
+  updatedById                 Int?
+  createdAt                   DateTime           @default(now())
+  updatedAt                   DateTime           @updatedAt
+
+  @@index([integrationType, isActive])
+  @@map("non_api_lab_configs")
+}
+
+// One authored answer to "when does OpsFlow message a provider, and with
+// what". The built-in ladder in lib/non-api-labs/ladder.ts remains the
+// fallback for labs no rule covers; a rule that matches replaces it.
+//
+// Two halves, deliberately separated:
+//   - the SCOPE + ANCHOR + OFFSET decide when a message is *scheduled*, at
+//     workflow start (plan time);
+//   - `sendCondition` decides whether it is still worth *sending* when that
+//     moment arrives (send time), re-evaluated against LabStack every tick.
+model ProviderCommunicationRule {
+  id                    String                 @id @default(cuid())
+  name                  String
+  isActive              Boolean                @default(true)
+  // Scope. Empty array means "every configured provider lab" / "every order
+  // type" — the same convention TaskRule.allowedTypes uses.
+  allowedLabIds         Json                   @default("[]")
+  allowedOrderTypes     Json                   @default("[]")
+  anchor                LabScheduleAnchor
+  action                LabScheduledActionType
+  offsetMinutes         Int
+  // P0..P4, P0 most urgent. Only breaks ties when two rules come due together.
+  priority              Int                    @default(4)
+  templateKey           String
+  // Who the message goes to. An escalation that lands back in the inbox that
+  // has been ignoring us is not an escalation.
+  recipient             String                 @default("LAB")
+  // Send-time gates. See SendCondition in lib/non-api-labs/rules.ts.
+  sendCondition         Json                   @default("{}")
+  // RELATIVE_DELAY = a timed sequence step, scheduled when the order arrives.
+  // SLA_BREACH     = a conditional watcher fired by the milestone engine.
+  //
+  // Breach steps are EXCLUDED from loadActiveCommunicationRules(), and that
+  // exclusion is load-bearing: workflow.ts does
+  //   `scopedRules.length > 0 ? ruleActions : buildLadder(...)`
+  // so any rule visible to that path replaces the provider's entire built-in
+  // ladder. Without the exclusion, adding one breach step would silently
+  // delete every sequence step the provider had.
+  triggerKind           StepTriggerKind        @default(RELATIVE_DELAY)
+  // Required exactly when triggerKind = SLA_BREACH; NULL otherwise. Enforced
+  // by a CHECK constraint in the migration as well as at the API layer.
+  slaMilestone          SlaMilestone?
+  // Per-step overrides for the lab's SlaMilestoneConfig cadence. NULL inherits.
+  repeatIntervalMinutes Int?
+  maxAttempts           Int?
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+
+  @@unique([name])
+  @@index([triggerKind, isActive])
+  @@index([isActive])
+  @@map("provider_communication_rules")
+}
+
+// ── SLA milestone breach ────────────────────────────────────────────────
+//
+// Every DateTime below is Timestamptz(3). The rest of this module stores
+// naive `timestamp`, so never compare these columns to a legacy one in raw
+// SQL without an explicit cast — the session TZ here is Asia/Kolkata and that
+// mismatch is exactly how this product's timezone incidents happened. Through
+// Prisma both shapes arrive as correct JS Dates, which is how the engine
+// reads them.
+
+/// One row per (lab, milestone). `labId = NULL` is the global default a lab
+/// row overrides. Postgres treats NULLs as distinct in a unique index, so the
+/// single-global-row guarantee is a partial unique index in the migration,
+/// not the @@unique below (which only covers the per-lab rows).
+model SlaMilestoneConfig {
+  id                    String       @id @default(cuid())
+  labId                 Int?
+  milestone             SlaMilestone
+  anchor                SlaAnchor
+  /// Signed. -60 = sixty minutes BEFORE the anchor. Always minutes.
+  offsetMinutes         Int
+  /// Ships false. A milestone the resolver cannot verify must stay off, or it
+  /// breaches on every order.
+  enabled               Boolean      @default(false)
+  repeatIntervalMinutes Int          @default(30)
+  /// Total messages including the first.
+  maxAttempts           Int          @default(3)
+  ignoreQuietHours      Boolean      @default(false)
+  createdAt             DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime     @updatedAt @db.Timestamptz(3)
+
+  @@unique([labId, milestone])
+  @@index([enabled])
+  @@map("sla_milestone_configs")
+}
+
+/// The ledger. `(orderId, milestone)` is the idempotency guarantee: detection
+/// upserts on it and never reads first, so repeated ticks and concurrent
+/// runners cannot produce a second event.
+model SlaBreachEvent {
+  id               String          @id @default(cuid())
+  /// LabStack public."Order".id — deliberately not a foreign key, same as
+  /// LabCommunicationWorkflow.orderId.
+  orderId          Int
+  labId            Int
+  milestone        SlaMilestone
+  deadlineAt       DateTime        @db.Timestamptz(3)
+  firstBreachedAt  DateTime        @db.Timestamptz(3)
+  attemptsSent     Int             @default(0)
+  lastSentAt       DateTime?       @db.Timestamptz(3)
+  /// NULL once the event is done. `status = ACTIVE AND nextAttemptAt <= now()`
+  /// is the whole engine query — no in-memory timers, restart-safe.
+  nextAttemptAt    DateTime?       @db.Timestamptz(3)
+  status           SlaBreachStatus @default(ACTIVE)
+  resolvedAt       DateTime?       @db.Timestamptz(3)
+  /// MILESTONE_COMPLETED | ORDER_CANCELLED | RESCHEDULED | MAX_ATTEMPTS | MANUAL_STOP
+  resolutionReason String?
+  createdAt        DateTime        @default(now()) @db.Timestamptz(3)
+
+  sends SlaBreachSend[]
+
+  @@unique([orderId, milestone])
+  @@index([status, nextAttemptAt])
+  @@index([labId, status])
+  @@map("sla_breach_events")
+}
+
+/// One row per attempt, written BEFORE the enqueue. Create-then-send means a
+/// crash between the two can only lose a message, never duplicate one.
+model SlaBreachSend {
+  id            String   @id @default(cuid())
+  breachEventId String
+  attemptNo     Int
+  /// The ProviderCommunicationRule (breach step) that produced this message.
+  /// Not a foreign key: deleting a step must not erase what it already sent.
+  ruleId        String?
+  /// FK into the existing outbound queue, for delivery status. NULL on a dry
+  /// run, and briefly NULL between the row being written and the enqueue.
+  waOutboundId  String?
+  /// Group JID or number actually used.
+  destination   String
+  /// Exactly what was sent, for the audit trail.
+  renderedBody  String
+  sentAt        DateTime @db.Timestamptz(3)
+  dryRun        Boolean  @default(false)
+
+  breachEvent SlaBreachEvent @relation(fields: [breachEventId], references: [id], onDelete: Cascade)
+
+  @@unique([breachEventId, attemptNo])
+  @@index([waOutboundId])
+  @@map("sla_breach_sends")
+}
+
+/// Single row, id "default". Exists so the kill switch and dry run can be
+/// flipped without a deploy — the gateway's DRY_RUN env stops sequence sends
+/// too, so it cannot serve as a breach-only switch.
+model ProviderCommsSettings {
+  id                 String   @id @default("default")
+  /// Master switch for SLA-breach sending only. Sequence steps are unaffected.
+  slaBreachEnabled   Boolean  @default(false)
+  /// Renders and records every attempt, advances attempt state, enqueues nothing.
+  slaBreachDryRun    Boolean  @default(true)
+  /// Clock-hour quiet window in TIMEZONE. Attempts defer to the next opening
+  /// unless the milestone sets ignoreQuietHours.
+  quietHoursStart    Int?
+  quietHoursEnd      Int?
+  /// Max breach messages per lab per tick. Excess rolls to the next tick.
+  perLabPerTickLimit Int      @default(2)
+  updatedAt          DateTime @updatedAt @db.Timestamptz(3)
+
+  @@map("provider_comms_settings")
+}
+
+// Idempotency boundary for the source Order-created event. `orderId` belongs
+// to LabStack's public.Order, and is intentionally not a foreign key here.
+model LabCommunicationWorkflow {
+  id                    String                         @id @default(cuid())
+  orderId               Int                            @unique
+  labId                 Int
+  status                LabCommunicationWorkflowStatus @default(WAITING_FOR_LAB_CONFIRMATION)
+  sourceOrderStatus     String?
+  orderSnapshot         Json
+  appointmentTime       DateTime?
+  confirmationDeadline  DateTime
+  reminderDeadline      DateTime
+  escalationDeadline    DateTime
+  acceptedAt            DateTime?
+  rescheduleRequestedAt DateTime?
+  rejectedAt            DateTime?
+  rejectionReason       String?
+  cancelledAt           DateTime?
+  completedAt           DateTime?
+  createdAt             DateTime                       @default(now())
+  updatedAt             DateTime                       @updatedAt
+
+  communications   LabCommunication[]
+  scheduledActions LabScheduledAction[]
+  actionTokens     LabProviderActionToken[]
+  escalations      LabCommunicationEscalation[]
+  events           LabCommunicationOrderEvent[]
+  auditLogs        LabCommunicationAuditLog[]
+
+  @@index([labId, status])
+  @@index([status, confirmationDeadline])
+  @@map("lab_communication_workflows")
+}
+
+// One row per requested or observed message. `waOutboundId`/providerMessageId
+// bridge to the existing WhatsApp queue without coupling this workflow to a
+// particular WhatsApp gateway implementation.
+model LabCommunication {
+  id                String                  @id @default(cuid())
+  // NULL only for SLA_BREACH messages. Breach alerts go to API labs as well,
+  // and an API lab has no confirmation workflow to hang off, so the order and
+  // lab are denormalized below rather than read through the relation.
+  workflowId        String?
+  // Always populated. For workflow-backed rows these mirror the workflow's own
+  // orderId/labId, which keeps "everything we sent this lab" a single query
+  // instead of a union across two shapes.
+  orderId           Int?
+  labId             Int?
+  channel           LabCommunicationChannel @default(WHATSAPP)
+  type              LabCommunicationType
+  status            LabCommunicationStatus  @default(QUEUED)
+  recipient         String
+  templateKey       String
+  templateVariables Json
+  // The ProviderCommunicationRule that produced this message, when one did.
+  // NULL for the initial notification and for built-in ladder rungs. Not a
+  // foreign key: deleting a rule must not erase what it already sent.
+  ruleId            String?
+  waOutboundId      String?                 @unique
+  providerMessageId String?                 @unique
+  idempotencyKey    String                  @unique
+  sentAt            DateTime?
+  deliveredAt       DateTime?
+  readAt            DateTime?
+  actionTakenAt     DateTime?
+  suppressedAt      DateTime?
+  failedAt          DateTime?
+  failureReason     String?
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+
+  workflow LabCommunicationWorkflow? @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([workflowId, createdAt])
+  @@index([status])
+  @@index([ruleId, createdAt])
+  // Drives the per-order breach cap ("have we already told this lab about
+  // order N?"), which is the only repetition guard on the breach path.
+  @@index([labId, createdAt])
+  @@map("lab_communications")
+}
+
+// Durable jobs claimed by the process-wide poller. The unique idempotency key
+// prevents a retry or duplicate order event from scheduling the same action.
+model LabScheduledAction {
+  id             String                   @id @default(cuid())
+  workflowId     String
+  type           LabScheduledActionType
+  status         LabScheduledActionStatus @default(PENDING)
+  // runAt is materialized (and indexed) but derived: anchor base + offsetMinutes.
+  // Recomputed when the appointment moves in LabStack.
+  anchor         LabScheduleAnchor        @default(ORDER)
+  offsetMinutes  Int                      @default(0)
+  // P0..P4, where P0 is most urgent. Breaks ties when both clocks fire together.
+  priority       Int                      @default(4)
+  rungKey        String?
+  // Set when a ProviderCommunicationRule scheduled this action. The built-in
+  // ladder leaves it NULL and identifies itself through rungKey instead.
+  ruleId         String?
+  runAt          DateTime
+  idempotencyKey String                   @unique
+  attempts       Int                      @default(0)
+  lockedAt       DateTime?
+  lockedBy       String?
+  completedAt    DateTime?
+  cancelledAt    DateTime?
+  lastError      String?
+  createdAt      DateTime                 @default(now())
+  updatedAt      DateTime                 @updatedAt
+
+  workflow LabCommunicationWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([status, runAt])
+  @@index([workflowId])
+  @@index([workflowId, status, priority], map: "lab_scheduled_actions_arbitration_idx")
+  @@index([ruleId, status])
+  @@map("lab_scheduled_actions")
+}
+
+// Only a cryptographic hash of the bearer token is persisted. A token is tied
+// to one workflow and one permitted action, expires, and records single use.
+model LabProviderActionToken {
+  id         String                @id @default(cuid())
+  workflowId String
+  action     LabProviderActionType
+  tokenHash  String                @unique
+  expiresAt  DateTime
+  usedAt     DateTime?
+  openedAt   DateTime?
+  usedIpHash String?
+  createdAt  DateTime              @default(now())
+
+  workflow LabCommunicationWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([workflowId, action])
+  @@index([expiresAt])
+  @@map("lab_provider_action_tokens")
+}
+
+model LabCommunicationEscalation {
+  id          String              @id @default(cuid())
+  workflowId  String
+  level       Int
+  status      LabEscalationStatus @default(OPEN)
+  recipient   String?
+  reason      String
+  triggeredAt DateTime            @default(now())
+  notifiedAt  DateTime?
+  resolvedAt  DateTime?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  workflow LabCommunicationWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@unique([workflowId, level])
+  @@index([status, triggeredAt])
+  @@map("lab_communication_escalations")
+}
+
+model LabCommunicationOrderEvent {
+  id         String            @id @default(cuid())
+  workflowId String
+  type       LabOrderEventType
+  actorType  String? // LAB | OPS | SYSTEM | WEBHOOK
+  actorId    String?
+  payload    Json?
+  occurredAt DateTime          @default(now())
+
+  workflow LabCommunicationWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([workflowId, occurredAt])
+  @@index([type])
+  @@map("lab_communication_order_events")
+}
+
+model LabCommunicationAuditLog {
+  id         String   @id @default(cuid())
+  workflowId String
+  action     String
+  actorType  String
+  actorId    String?
+  requestId  String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  workflow LabCommunicationWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([workflowId, createdAt])
+  @@index([requestId])
+  @@map("lab_communication_audit_logs")
 }

@@ -39,6 +39,43 @@ interface OrderTask {
   taskType: { label: string } | null;
 }
 
+/** A milestone SLA breach on this order, from lib/provider-comms. */
+interface OrderSlaBreach {
+  id: string;
+  milestone: string;
+  deadlineAt: string;
+  overdueMinutes: number;
+  attemptsSent: number;
+  nextAttemptAt: string | null;
+  status: "ACTIVE" | "RESOLVED" | "CAPPED" | "CANCELLED";
+  resolutionReason: string | null;
+  lastDeliveryStatus: string | null;
+}
+
+const MILESTONE_LABELS: Record<string, string> = {
+  ORDER_CONFIRMED: "Order confirmed",
+  PHLEBO_ASSIGNED: "Phlebotomist assigned",
+  SAMPLE_COLLECTED: "Sample collected",
+  SAMPLE_DELIVERED: "Sample delivered to lab",
+  REPORT_UPLOADED: "Report uploaded",
+};
+
+const BREACH_STATUS_STYLE: Record<OrderSlaBreach["status"], string> = {
+  ACTIVE: "bg-rose-500/10 text-rose-300",
+  RESOLVED: "bg-emerald-500/10 text-emerald-300",
+  CAPPED: "bg-amber-500/10 text-amber-300",
+  CANCELLED: "bg-zinc-800 text-zinc-400",
+};
+
+/** "1h 20m" — always unit-labelled, never a bare number. */
+function overdueLabel(totalMinutes: number): string {
+  const minutes = Math.max(0, totalMinutes);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+}
+
 interface OrderQuickViewProps {
   orderId: number;
   onClose: () => void;
@@ -67,6 +104,7 @@ function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
 export default function OrderQuickView({ orderId, onClose }: OrderQuickViewProps) {
   const [order, setOrder] = useState<OrderDetail | null>(null);
   const [tasks, setTasks] = useState<OrderTask[]>([]);
+  const [slaBreaches, setSlaBreaches] = useState<OrderSlaBreach[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -84,6 +122,7 @@ export default function OrderQuickView({ orderId, onClose }: OrderQuickViewProps
         const data = await res.json();
         setOrder(data.order);
         setTasks(data.tasks ?? []);
+        setSlaBreaches(data.slaBreaches ?? []);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to load order");
       } finally {
@@ -192,6 +231,65 @@ export default function OrderQuickView({ orderId, onClose }: OrderQuickViewProps
                         <p className="text-xs text-zinc-400 leading-relaxed whitespace-pre-wrap bg-zinc-800 rounded-lg px-3 py-2.5">{order.internalNotes}</p>
                       </div>
                     )}
+                  </div>
+                </div>
+              )}
+
+              {/* Milestone SLA breaches — what the PROVIDER was chased about.
+                  Distinct from the tasks below, which are OpsFlow's own
+                  internal work: a breach here is a message that went to the
+                  lab, and it exists for API labs too. Hidden entirely when
+                  there are none, so the drawer does not grow an empty section
+                  on the majority of orders. */}
+              {slaBreaches.length > 0 && (
+                <div>
+                  <h3 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-widest mb-3">
+                    SLA Breaches
+                    <span className="ml-1.5 text-zinc-600">({slaBreaches.length})</span>
+                  </h3>
+                  <div className="space-y-2">
+                    {slaBreaches.map((breach) => (
+                      <div key={breach.id} className="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-3">
+                        <div className="flex items-start justify-between gap-2 mb-2">
+                          <div className="flex-1 min-w-0">
+                            <div className="text-xs font-medium text-zinc-200 leading-snug">
+                              {MILESTONE_LABELS[breach.milestone] ?? breach.milestone}
+                            </div>
+                            <div className="text-[10px] text-zinc-600 mt-0.5">
+                              Due {formatISTTimestamp(breach.deadlineAt, { hour: "2-digit", minute: "2-digit" })}
+                            </div>
+                          </div>
+                          <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${BREACH_STATUS_STYLE[breach.status]}`}>
+                            {breach.status}
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-3">
+                          <span className={`text-[10px] font-semibold ${breach.status === "ACTIVE" ? "text-rose-400" : "text-zinc-500"}`}>
+                            +{overdueLabel(breach.overdueMinutes)} overdue
+                          </span>
+                          <span className="text-[10px] text-zinc-500">
+                            {breach.attemptsSent} attempt{breach.attemptsSent === 1 ? "" : "s"} to the lab
+                          </span>
+                          {breach.lastDeliveryStatus && (
+                            <span
+                              className={`text-[10px] ${
+                                breach.lastDeliveryStatus === "FAILED" ? "text-rose-400"
+                                  : breach.lastDeliveryStatus === "SENT" ? "text-emerald-500"
+                                  : breach.lastDeliveryStatus === "DRY_RUN" ? "text-amber-400"
+                                  : "text-zinc-500"
+                              }`}
+                            >
+                              {breach.lastDeliveryStatus}
+                            </span>
+                          )}
+                          {breach.resolutionReason && (
+                            <span className="text-[10px] text-zinc-600">
+                              {breach.resolutionReason.replaceAll("_", " ").toLowerCase()}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}

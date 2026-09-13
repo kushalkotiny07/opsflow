@@ -107,6 +107,11 @@ export async function GET(
       status: true,
       priority: true,
       slaDeadline: true,
+      // Both are declared on the drawer's OrderTask type and completedAt is
+      // rendered ("Done HH:MM"), but neither was selected — so a completed
+      // task silently showed no completion time.
+      slaBreachedAt: true,
+      completedAt: true,
       createdAt: true,
       assignedTo: { select: { id: true, name: true } },
       taskType: { select: { label: true } },
@@ -118,5 +123,46 @@ export async function GET(
     ],
   });
 
-  return NextResponse.json({ order, tasks });
+  // Milestone SLA breaches for this order — what the provider was chased
+  // about, and whether it got through. Keyed on the order alone, so it is
+  // present for API labs too (they have no communication workflow).
+  const breachRows = await prisma.slaBreachEvent.findMany({
+    where: { orderId },
+    orderBy: { firstBreachedAt: "desc" },
+    include: { sends: { orderBy: { attemptNo: "desc" }, take: 1 } },
+  });
+  const breachOutboundIds = breachRows
+    .map((row) => row.sends[0]?.waOutboundId)
+    .filter((value): value is string => !!value);
+  const breachDelivery = new Map(
+    (breachOutboundIds.length
+      ? await prisma.waOutbound.findMany({ where: { id: { in: breachOutboundIds } }, select: { id: true, status: true } })
+      : []
+    ).map((row) => [row.id, row.status]),
+  );
+
+  const slaBreaches = breachRows.map((row) => {
+    const latest = row.sends[0] ?? null;
+    return {
+      id: row.id,
+      milestone: row.milestone,
+      deadlineAt: row.deadlineAt,
+      // Frozen at resolution rather than counted to now — a breach that
+      // closed yesterday is not still getting later.
+      overdueMinutes: Math.round(
+        ((row.resolvedAt?.getTime() ?? Date.now()) - row.deadlineAt.getTime()) / 60_000,
+      ),
+      attemptsSent: row.attemptsSent,
+      nextAttemptAt: row.nextAttemptAt,
+      status: row.status,
+      resolutionReason: row.resolutionReason,
+      lastDeliveryStatus: latest?.dryRun
+        ? "DRY_RUN"
+        : latest?.waOutboundId
+          ? breachDelivery.get(latest.waOutboundId) ?? null
+          : null,
+    };
+  });
+
+  return NextResponse.json({ order, tasks, slaBreaches });
 }

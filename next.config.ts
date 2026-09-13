@@ -16,12 +16,6 @@ const nextConfig: NextConfig = {
   // Carried over from the now-deleted next.config.js. node-cron pulls in
   // node:* built-ins that webpack chokes on if it tries to bundle them.
   serverExternalPackages: ["node-cron"],
-  // Build output goes to ./build instead of ./.next — works around a
-  // local Next 15.5.15 race where something on this machine (Spotlight /
-  // a watcher / VS Code extension) keeps deleting `.next/server/*`
-  // manifests between webpack's compile-finish and the manifest writer.
-  // The hidden-dotfile path appears to be the trigger.
-  distDir: "build",
 };
 
 export default nextConfig;

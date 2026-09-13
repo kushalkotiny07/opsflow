@@ -38,7 +38,7 @@
  */
 // Poller fetchers run on the WORKER pool (separate from API). A worker
 // outage or a slow labstack here will not starve API request slots.
-import { labstackWorkerQuery as labstackQuery } from "@/lib/db/labstack";
+import { labstackWorkerQuery as labstackQuery, labstack, labstackOr } from "@/lib/db/labstack";
 
 // ── Appointment-time window ───────────────────────────────────────────
 // CRITICAL (June 2026 incident): full-table scans of public."Order" wedge
@@ -263,6 +263,60 @@ export async function fetchActiveOrdersByStatus(
     `,
     statuses
   );
+}
+
+/** Current source-of-truth state for one order. Read-only, by id. */
+export interface OrderSnapshot {
+  id: number;
+  orderStatus: string;
+  appointmentTime: Date | null;
+}
+
+const SNAPSHOT_DEADLINE_MS = parseInt(process.env.LABSTACK_SNAPSHOT_DEADLINE_MS ?? "4000", 10);
+
+/**
+ * Re-read the current status of specific orders, by id.
+ *
+ * The non-API lab runner calls this immediately before every outbound message.
+ * Without it, suppression can only consult OpsFlow's own workflow status, and
+ * a cancelled order — which drops out of `fetchAllActiveOrders` entirely —
+ * keeps its pending reminders and cheerfully WhatsApps the lab about a patient
+ * who cancelled.
+ *
+ * Deliberately unlike the bulk fetchers above:
+ *  - it takes NO status filter and NO appointment window. Absence from the
+ *    poll is ambiguous (cancelled? completed? just a far-future appointment?),
+ *    so the caller needs the real status rather than an inference from absence.
+ *  - it runs on the API pool, not the worker pool, and is a primary-key lookup.
+ *    The MultiXact incident that motivated `probeLabstackHealthy` wedges bulk
+ *    scans; that probe's own notes record that a contended replica still
+ *    answers point lookups instantly. So this stays responsive even when the
+ *    replica is too sick for the 5-minute poll cycle to run.
+ *  - it is wrapped in `labstackOr`, so it is breaker-aware and returns null on
+ *    timeout instead of hanging. Null means "unknown", never "cancelled" — the
+ *    caller must retry rather than suppress.
+ *
+ * Still strictly read-only: see the hard rule at the top of this file.
+ */
+export async function fetchOrderSnapshotsByIds(ids: number[]): Promise<Map<number, OrderSnapshot> | null> {
+  const unique = Array.from(new Set(ids.filter((id) => Number.isInteger(id))));
+  if (unique.length === 0) return new Map();
+
+  // orderStatus is cast to text so we don't have to bind labstack's custom
+  // OrderStatus enum from a JS string (same trick as taskRetirer).
+  const query = labstack.$queryRawUnsafe<OrderSnapshot[]>(
+    `SELECT id, "orderStatus"::text AS "orderStatus", "appointmentTime"
+       FROM public."Order"
+      WHERE id = ANY($1::int[])`,
+    unique,
+  );
+
+  const rows = await labstackOr<OrderSnapshot[] | null>(query, null, SNAPSHOT_DEADLINE_MS, {
+    breakerKey: "api",
+  });
+  if (rows === null) return null;
+
+  return new Map(rows.map((row) => [row.id, row]));
 }
 
 // (Removed) appendOrderNote — used to UPDATE public."Order".internalNotes

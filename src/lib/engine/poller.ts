@@ -20,74 +20,20 @@ import { runSourceHealthWatcher } from "./sourceHealthWatcher";
 import { runSlaWatcher } from "./slaWatcher";
 import { sendDailySummary } from "./dailySummary";
 import { runTaskRetirer, RetirementStats } from "./taskRetirer";
+import { startDetectedNonApiLabWorkflows } from "@/lib/non-api-labs/workflow";
+import { acquireLock, releaseLock, POLLING_LOCK_KEY } from "./pollingLock";
 
 const POLLING_INTERVAL_MS = parseInt(process.env.POLLING_INTERVAL_MS ?? "300000", 10);
 const CRON_EXPRESSION = intervalToCron(POLLING_INTERVAL_MS);
 
-// W2.4 — Polling lock with ownership token + tunable TTL.
-//
-// History of this lock:
-// - v1: row in taskos.polling_locks with 60s TTL. Cycles longer than 60s
-//   let a second cycle start in parallel; the TTL was a hint, not a mutex.
-// - v2 (attempted): pg_try_advisory_lock session-scoped — but Prisma's
-//   connection pool means lock and unlock can land on different physical
-//   connections, leaving the lock held forever from a previous session's
-//   POV. Pure-DB session locks need a single pinned connection, which
-//   would require a deeper Prisma refactor.
-// - v3 (this): row-based TTL lock with an INSTANCE_ID owner token. Only
-//   the instance that took the lock can release it. TTL is configurable
-//   (default 10 min) so cycles longer than the previous 60s budget don't
-//   silently double-fire. If a process dies mid-cycle, the TTL is the
-//   safety net that lets a new instance reclaim the lock.
-// Process-unique instance ID for the polling lock's ownership token. Just a
-// random hex string — we only need uniqueness across concurrent processes,
-// not cryptographic security. Avoids the `crypto` import dance with Next's
-// webpack config (which doesn't accept node: scheme in this setup).
-function makeInstanceId(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-const POLLING_LOCK_KEY = 1000;
+// W2.4 — Polling lock with ownership token + tunable TTL. The implementation
+// (and the history of why it is a row lock rather than a pg advisory lock)
+// now lives in ./pollingLock so the non-API lab tick can share it under its
+// own key.
 const POLLING_LOCK_TTL_MS = parseInt(process.env.POLLING_LOCK_TTL_MS ?? "600000", 10); // 10 min default
-const INSTANCE_ID = makeInstanceId();
 
-async function acquirePollingLock(): Promise<boolean> {
-  try {
-    const now = new Date();
-    const lockUntil = new Date(now.getTime() + POLLING_LOCK_TTL_MS);
-
-    // Stash the instance UUID in `lockedBy` so release can verify ownership.
-    const result = await prisma.$queryRaw<Array<{ acquired: boolean }>>`
-      INSERT INTO taskos."polling_locks" ("lockKey", "lockedAt", "lockedUntil", "lockedBy")
-      VALUES (${POLLING_LOCK_KEY}, ${now}, ${lockUntil}, ${INSTANCE_ID})
-      ON CONFLICT ("lockKey")
-      DO UPDATE SET
-        "lockedAt" = ${now},
-        "lockedUntil" = ${lockUntil},
-        "lockedBy" = ${INSTANCE_ID}
-      WHERE "polling_locks"."lockedUntil" < ${now}
-      RETURNING TRUE as "acquired";
-    `;
-    return result.length > 0;
-  } catch (err) {
-    console.error("[Poller] Lock acquisition error:", err);
-    return false;
-  }
-}
-
-async function releasePollingLock(): Promise<void> {
-  try {
-    // Only delete if WE own the lock — protects against a leftover row
-    // belonging to a different (still-running) instance.
-    await prisma.$executeRaw`
-      DELETE FROM taskos."polling_locks"
-      WHERE "lockKey" = ${POLLING_LOCK_KEY}
-        AND "lockedBy" = ${INSTANCE_ID}
-    `;
-  } catch (err) {
-    console.error("[Poller] Lock release error:", err);
-  }
-}
+const acquirePollingLock = () => acquireLock(POLLING_LOCK_KEY, POLLING_LOCK_TTL_MS, "Poller");
+const releasePollingLock = () => releaseLock(POLLING_LOCK_KEY, "Poller");
 
 // ── W2.2: Polling checkpoint ────────────────────────────────────────────────
 // Stores the last `updatedAt` we successfully consumed from a source so the
@@ -183,6 +129,28 @@ export async function runPollCycle(): Promise<void> {
     const orders = await fetchAllActiveOrders(since);
     ordersFound = orders.length;
     console.log(`[Poller] ${ordersFound} active orders fetched from labstack${since ? ` since ${since.toISOString()}` : " (full scan)"}`);
+
+    // 1b. Non-API lab communication workflows. This observes the same source
+    // orders as task creation but owns all state in taskos; the helper's
+    // unique(orderId) boundary makes replays from the checkpoint overlap safe.
+    // A failure here is isolated so API-integrated orders and the established
+    // task engine preserve their existing behavior.
+    try {
+      const nonApi = await startDetectedNonApiLabWorkflows(orders);
+      if (nonApi.started || nonApi.failed) {
+        console.log(`[Poller] Non-API workflows: started=${nonApi.started}, existing=${nonApi.existing}, skipped=${nonApi.skipped}, failed=${nonApi.failed}`);
+      }
+    } catch (nonApiError) {
+      console.error("[Poller] Non-API workflow trigger failed (non-fatal):", nonApiError);
+    }
+
+    // 1c. (Moved) Due reminder/escalation jobs used to run here. They now have
+    // their own 1-minute cron in lib/non-api-labs/runner.ts under lock key
+    // 1001. Running them here made the communication clock a hostage of the
+    // pre-flight probe below: a replica too contended for bulk scans silenced
+    // every reminder and escalation, even though the runner only needs
+    // primary-key lookups, which stay fast on a contended replica. The
+    // workflow starter above stays put — it genuinely consumes the bulk fetch.
 
     // 2. Load active rules
     const rules = await loadActiveRules();

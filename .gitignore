@@ -32,3 +32,11 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 tsconfig.tsbuildinfo
+
+# Real patient data transcribed from the "Labstacks orders" sheet: names,
+# mobile numbers and dates of birth for 210 people. This repository is
+# public, so the rows themselves stay local — `npm run dummy:generate`
+# rebuilds 02-seed.sql from data/*.csv, and docker/labstack-dummy/README.md
+# documents the expected CSV shape.
+docker/labstack-dummy/data/
+docker/labstack-dummy/02-seed.sql

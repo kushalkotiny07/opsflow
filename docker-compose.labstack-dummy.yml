@@ -1,0 +1,58 @@
+# Local LabStack source-of-truth overlay — DUMMY DATA.
+#
+# Usage:  docker compose -f docker-compose.yml -f docker-compose.labstack-dummy.yml up -d --build
+#         (or `npm run dummy:up`)
+#
+# Adds a second Postgres, `labstack-db`, shaped like the LabStack database
+# OpsFlow reads from (public."Order" / "User" / "Lab" / "Store" plus the
+# OrderType / OrderStatus enums) and seeded from the "Labstacks orders"
+# sheet — 215 orders across 13 labs and 9 partner stores. It then points the
+# app's SOURCE_DATABASE_URL at it, so the rule engine finally has something
+# to poll locally instead of running against a blank source.
+#
+# The seed lands the sheet's operating day on whatever day you bring the
+# stack up (see docker/labstack-dummy/generate-seed.mjs), which is what keeps
+# the orders inside the poller's NOW() ± 10 day appointment window.
+#
+# Nothing here touches the `db` container: OpsFlow's own taskos schema and
+# this stand-in source stay in separate databases, exactly as in production.
+services:
+  labstack-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${LABSTACK_DB_NAME:-labstack}
+      POSTGRES_USER: ${LABSTACK_DB_USER:-labstack}
+      POSTGRES_PASSWORD: ${LABSTACK_DB_PASSWORD:-labstack_dev_password}
+      # Asia/Kolkata so the seed's day-shift (CURRENT_DATE) matches the IST
+      # operating day the app and the sheet both work in.
+      TZ: ${TIMEZONE:-Asia/Kolkata}
+      PGTZ: ${TIMEZONE:-Asia/Kolkata}
+    volumes:
+      # Postgres runs *.sql here in name order on FIRST boot only:
+      # 01-schema.sql then 02-seed.sql. Mounted (not copied) so the same
+      # files can be re-run later — see `npm run dummy:reseed`.
+      - ./docker/labstack-dummy:/docker-entrypoint-initdb.d:ro
+      - opsflow_labstack_dummy_data:/var/lib/postgresql/data
+    ports:
+      # 5434 on the host: 5432 is the user's own Postgres, 5433 is the
+      # taskos `db` container above.
+      - "${LABSTACK_DB_PORT:-5434}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LABSTACK_DB_USER:-labstack} -d ${LABSTACK_DB_NAME:-labstack}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
+      labstack-db:
+        condition: service_healthy
+    environment:
+      SOURCE_DATABASE_URL: postgresql://${LABSTACK_DB_USER:-labstack}:${LABSTACK_DB_PASSWORD:-labstack_dev_password}@labstack-db:5432/${LABSTACK_DB_NAME:-labstack}
+
+volumes:
+  opsflow_labstack_dummy_data:
