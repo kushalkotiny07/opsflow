@@ -148,6 +148,9 @@ const navItems: NavItem[] = [
     href: "/head/non-api-labs",
     roles: ["OPS_HEAD"],
     children: [
+      // First because it is the "what is happening right now" screen; the rest
+      // are configuration you visit when something on this board is wrong.
+      { label: "Today & Tomorrow", href: "/head/non-api-labs/board" },
       { label: "Lab Config", href: "/head/non-api-labs/lab-config" },
       { label: "Task Rules", href: "/head/non-api-labs/task-rules" },
       { label: "Templates", href: "/head/non-api-labs/templates" },

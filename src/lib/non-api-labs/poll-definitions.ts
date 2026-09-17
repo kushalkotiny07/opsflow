@@ -111,8 +111,13 @@ Please reply with the reason so we can reassign it.`,
 function isPollOption(value: unknown): value is PollOption {
   if (!value || typeof value !== "object") return false;
   const option = value as Record<string, unknown>;
+  // `ack` is NOT required. Polls sent before replies were configurable stored
+  // options as {label, action} only, and they may still be sitting unanswered
+  // in a group. Rejecting them here would leave the option unmatchable, so the
+  // vote would move the order but the provider would hear nothing back — and
+  // the poll would look broken for a reason nobody could see.
   return typeof option.label === "string" && option.label.trim().length > 0
-    && typeof option.ack === "string"
+    && (option.ack === undefined || option.ack === null || typeof option.ack === "string")
     && (option.action === null || option.action === undefined
       || ["ACCEPT", "RESCHEDULE", "REJECT"].includes(option.action as string));
 }
@@ -123,7 +128,9 @@ export function parsePollOptions(raw: unknown): PollOption[] {
   return raw.filter(isPollOption).map((option) => ({
     label: option.label.trim(),
     action: option.action ?? null,
-    ack: option.ack,
+    // An option with no reply is silent, which is a valid choice and the only
+    // honest reading of a poll sent before replies existed.
+    ack: option.ack ?? "",
   }));
 }
 

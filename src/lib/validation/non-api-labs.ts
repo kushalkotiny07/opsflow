@@ -24,6 +24,11 @@ export type NonApiLabConfigInput = {
   slaBreachAlertsEnabled?: unknown;
   slaBreachTemplateKey?: unknown;
   slaBreachMaxPerOrder?: unknown;
+  dailyDigestEnabled?: unknown;
+  dailyDigestHour?: unknown;
+  dailyDigestMinute?: unknown;
+  dailyDigestTemplateKey?: unknown;
+  dailyDigestSkipWhenEmpty?: unknown;
 };
 
 export type ValidatedNonApiLabConfig = {
@@ -47,6 +52,11 @@ export type ValidatedNonApiLabConfig = {
   slaBreachAlertsEnabled: boolean;
   slaBreachTemplateKey: string;
   slaBreachMaxPerOrder: number;
+  dailyDigestEnabled: boolean;
+  dailyDigestHour: number;
+  dailyDigestMinute: number;
+  dailyDigestTemplateKey: string;
+  dailyDigestSkipWhenEmpty: boolean;
 };
 
 function optionalText(value: unknown, field: string, errors: Record<string, string>): string | null {
@@ -161,6 +171,30 @@ export function validateNonApiLabConfig(input: NonApiLabConfigInput):
     errors.slaBreachMaxPerOrder = "must be a whole number between 1 and 20";
   }
 
+  // ── Daily digest ───────────────────────────────────────────────────────
+  for (const field of ["dailyDigestEnabled", "dailyDigestSkipWhenEmpty"] as const) {
+    if (input[field] !== undefined && typeof input[field] !== "boolean") errors[field] = "must be true or false";
+  }
+  const dailyDigestEnabled = typeof input.dailyDigestEnabled === "boolean" ? input.dailyDigestEnabled : false;
+  const dailyDigestSkipWhenEmpty =
+    typeof input.dailyDigestSkipWhenEmpty === "boolean" ? input.dailyDigestSkipWhenEmpty : true;
+
+  // A wall-clock time, not a duration: 0 is midnight, and every hour of the
+  // day is a legitimate choice, so neither of these can reuse positiveInt.
+  const rawHour = input.dailyDigestHour ?? 19;
+  const digestHour = typeof rawHour === "number" ? rawHour : Number(rawHour);
+  if (!Number.isInteger(digestHour) || digestHour < 0 || digestHour > 23) {
+    errors.dailyDigestHour = "must be an hour between 0 and 23";
+  }
+  const rawMinute = input.dailyDigestMinute ?? 0;
+  const digestMinute = typeof rawMinute === "number" ? rawMinute : Number(rawMinute);
+  if (!Number.isInteger(digestMinute) || digestMinute < 0 || digestMinute > 59) {
+    errors.dailyDigestMinute = "must be a minute between 0 and 59";
+  }
+  if (input.dailyDigestTemplateKey !== undefined && (typeof input.dailyDigestTemplateKey !== "string" || !input.dailyDigestTemplateKey.trim())) {
+    errors.dailyDigestTemplateKey = "must be a template key";
+  }
+
   // 0 is a legitimate value here — it means "no quiet window" — so this can't
   // reuse positiveInt.
   const rawQuietWindow = input.quietWindowMinutes ?? 10;
@@ -205,6 +239,14 @@ export function validateNonApiLabConfig(input: NonApiLabConfigInput):
           ? input.slaBreachTemplateKey.trim()
           : "PROVIDER_SLA_BREACH",
       slaBreachMaxPerOrder: breachCapNumber,
+      dailyDigestEnabled,
+      dailyDigestHour: digestHour,
+      dailyDigestMinute: digestMinute,
+      dailyDigestTemplateKey:
+        typeof input.dailyDigestTemplateKey === "string" && input.dailyDigestTemplateKey.trim()
+          ? input.dailyDigestTemplateKey.trim()
+          : "PROVIDER_DAILY_DIGEST",
+      dailyDigestSkipWhenEmpty,
     },
   };
 }

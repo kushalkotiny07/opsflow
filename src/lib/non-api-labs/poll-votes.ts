@@ -23,6 +23,29 @@ import { parsePollOptions } from "./poll-definitions";
 import { formatDate, formatTime } from "./scheduler";
 
 /**
+ * Today's wording for an option, used only when a sent poll carried none.
+ *
+ * Matched on label first — that is what the provider actually tapped — and on
+ * action as a fallback, so a definition whose labels have since been reworded
+ * can still answer an older poll.
+ */
+async function currentAckFor(label: string, action: LabProviderActionType | null): Promise<string | null> {
+  const definitions = await prisma.waPollDefinition.findMany({ where: { isActive: true } });
+  for (const definition of definitions) {
+    const options = parsePollOptions(definition.options);
+    const byLabel = options.find((option) => option.label === label && option.ack.trim());
+    if (byLabel) return byLabel.ack;
+  }
+  if (!action) return null;
+  for (const definition of definitions) {
+    const options = parsePollOptions(definition.options);
+    const byAction = options.find((option) => option.action === action && option.ack.trim());
+    if (byAction) return byAction.ack;
+  }
+  return null;
+}
+
+/**
  * Answer the provider in their own group.
  *
  * Queued through wa_outbound rather than sent straight from the gateway, so it
@@ -51,7 +74,22 @@ async function acknowledge(poll: {
   const chosen = poll.votedLabel
     ? options.find((option) => option.label === poll.votedLabel)
     : options.find((option) => option.action === poll.votedAction);
-  if (!chosen?.ack?.trim()) return;
+  if (!chosen) return;
+
+  // A poll sent before replies were configurable stored {label, action} only,
+  // and those polls are still sitting in provider groups — indistinguishable
+  // from new ones. Tapping one applied the vote and answered with silence,
+  // which reads as the feature being broken. So when the snapshot carries no
+  // reply, fall back to whatever the live definition says for that same option.
+  //
+  // This does not violate the snapshot rule: the ACTION still comes from the
+  // stored copy, so the poll means exactly what it meant when it was sent. Only
+  // the wording — which was never captured — is filled in from today's text.
+  let ack = chosen.ack?.trim() ?? "";
+  if (!ack) {
+    ack = (await currentAckFor(chosen.label, chosen.action)) ?? "";
+    if (!ack) return; // genuinely nothing to say
+  }
 
   const workflow = await prisma.labCommunicationWorkflow.findUnique({
     where: { id: poll.workflowId },
@@ -63,7 +101,7 @@ async function acknowledge(poll: {
   if (!config || !config.isActive) return;
 
   const snapshot = (workflow.orderSnapshot ?? {}) as { patientName?: string; location?: string; tests?: string };
-  const text = renderLabTemplate(chosen.ack, {
+  const text = renderLabTemplate(ack, {
     order_id: String(workflow.orderId),
     lab_name: config.labName,
     patient_name: snapshot.patientName || "Patient",

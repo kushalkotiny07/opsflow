@@ -15,6 +15,10 @@
  * a T-10m reminder scheduled on a 5-minute grid can land up to five minutes
  * late, which is most of its usefulness gone.
  *
+ * Three jobs share the tick: poll votes, the confirmation ladder, and — once
+ * a day per lab — the provider digest. One loop and one lock rather than three
+ * schedulers racing each other for the same provider's attention.
+ *
  * Lock key 1001 is separate from the poller's 1000, so the two loops never
  * block each other.
  */
@@ -22,6 +26,7 @@ import { acquireLock, releaseLock, NON_API_LAB_LOCK_KEY } from "@/lib/engine/pol
 import { processDueNonApiLabScheduledActions } from "./scheduler";
 import { processPollVotes } from "./poll-votes";
 import { runSlaBreachTick } from "@/lib/provider-comms/breach-engine";
+import { runDailyDigestTick } from "@/lib/provider-comms/daily-digest";
 
 const TICK_CRON = process.env.NON_API_LAB_TICK_CRON ?? "* * * * *";
 // Short TTL: a tick is seconds of work, and a dead process should not hold the
@@ -76,6 +81,22 @@ export async function runNonApiLabTick(): Promise<void> {
       }
     } catch (error) {
       console.error("[SlaBreachTick] Cycle error:", error);
+    }
+    // The daily digest shares this tick for the same reason the breach engine
+    // does — one lock, one loop — but for a second reason of its own: a cron
+    // pinned to 19:00 loses the whole digest if the process happens to be
+    // restarting that minute, silently and until tomorrow. Asking "is the slot
+    // open and unsent?" every minute simply catches up instead.
+    try {
+      const digest = await runDailyDigestTick();
+      if (digest.queued || digest.failed) {
+        console.log(
+          `[ProviderDigest] queued=${digest.queued} empty=${digest.empty} ` +
+          `skipped=${digest.skipped} failed=${digest.failed}`,
+        );
+      }
+    } catch (error) {
+      console.error("[ProviderDigest] Cycle error:", error);
     }
   } catch (error) {
     console.error("[NonApiLabTick] Cycle error:", error);

@@ -1176,6 +1176,10 @@ enum LabCommunicationType {
   // workflow — it applies to API labs too, which never run that workflow — so
   // a SLA_BREACH row is the one kind that can carry a null workflowId.
   SLA_BREACH
+  // The once-a-day wrap-up: what the provider handled today and what lands
+  // tomorrow. The only type that is about a DAY rather than an order, so it
+  // carries a null orderId as well as a null workflowId.
+  DAILY_DIGEST
 }
 
 enum LabCommunicationStatus {
@@ -1357,6 +1361,20 @@ model NonApiLabConfig {
   // a row. This caps how many reach the provider for a single order; further
   // breaches are still recorded by the SLA watcher, just not re-sent.
   slaBreachMaxPerOrder        Int                @default(2)
+  // ── Daily digest ─────────────────────────────────────────────────────────
+  // One message a day: how today went, and what lands tomorrow. Off by
+  // default — a recurring broadcast to a real provider group is something a
+  // human turns on per lab, never something a deploy starts doing.
+  dailyDigestEnabled          Boolean            @default(false)
+  // Local clock (TIMEZONE), not UTC: "send at 19:00" means the provider's
+  // 19:00. Evening by default, when today is done and tomorrow is plannable.
+  dailyDigestHour             Int                @default(19)
+  dailyDigestMinute           Int                @default(0)
+  dailyDigestTemplateKey      String             @default("PROVIDER_DAILY_DIGEST")
+  // A digest saying "0 today, 0 tomorrow" every evening trains the provider to
+  // ignore the whole thread, so by default a quiet day sends nothing. Labs
+  // that want the daily heartbeat regardless can turn this off.
+  dailyDigestSkipWhenEmpty    Boolean            @default(true)
   createdById                 Int?
   updatedById                 Int?
   createdAt                   DateTime           @default(now())
@@ -1570,13 +1588,17 @@ model LabCommunicationWorkflow {
 // particular WhatsApp gateway implementation.
 model LabCommunication {
   id                String                  @id @default(cuid())
-  // NULL only for SLA_BREACH messages. Breach alerts go to API labs as well,
-  // and an API lab has no confirmation workflow to hang off, so the order and
-  // lab are denormalized below rather than read through the relation.
+  // NULL for SLA_BREACH and DAILY_DIGEST messages. Breach alerts go to API
+  // labs as well, and an API lab has no confirmation workflow to hang off; a
+  // digest is about a whole day and belongs to no single order. Both are why
+  // the order and lab are denormalized below rather than read through the
+  // relation.
   workflowId        String?
-  // Always populated. For workflow-backed rows these mirror the workflow's own
-  // orderId/labId, which keeps "everything we sent this lab" a single query
-  // instead of a union across two shapes.
+  // labId is always populated. orderId is too, except on DAILY_DIGEST rows —
+  // a digest is about a lab's day, not about one order. For workflow-backed
+  // rows these mirror the workflow's own orderId/labId, which keeps
+  // "everything we sent this lab" a single query instead of a union across
+  // two shapes.
   orderId           Int?
   labId             Int?
   channel           LabCommunicationChannel @default(WHATSAPP)

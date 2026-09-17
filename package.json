@@ -7,7 +7,7 @@
     "build": "rm -rf .next && node node_modules/next/dist/bin/next build",
     "start": "node node_modules/next/dist/bin/next start",
     "lint": "eslint",
-    "test": "node --import tsx --test src/lib/non-api-labs/__tests__/*.test.ts",
+    "test": "node --import tsx --test src/lib/non-api-labs/__tests__/*.test.ts src/lib/provider-comms/__tests__/*.test.ts",
     "db:seed": "node node_modules/.bin/tsx prisma/seed.ts",
     "db:migrate": "node node_modules/prisma/build/index.js migrate dev",
     "db:studio": "node node_modules/prisma/build/index.js studio",

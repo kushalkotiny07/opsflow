@@ -22,6 +22,10 @@ type LabConfig = {
   quietWindowMinutes: number;
   slaBreachAlertsEnabled: boolean;
   slaBreachMaxPerOrder: number;
+  dailyDigestEnabled: boolean;
+  dailyDigestHour: number;
+  dailyDigestMinute: number;
+  dailyDigestSkipWhenEmpty: boolean;
 };
 
 type Draft = {
@@ -42,6 +46,10 @@ type Draft = {
   quietWindowMinutes: string;
   slaBreachAlertsEnabled: boolean;
   slaBreachMaxPerOrder: string;
+  dailyDigestEnabled: boolean;
+  /** "HH:MM" — one <input type="time">, split into hour/minute on save. */
+  dailyDigestAt: string;
+  dailyDigestSkipWhenEmpty: boolean;
 };
 
 const EMPTY_DRAFT: Draft = {
@@ -50,6 +58,7 @@ const EMPTY_DRAFT: Draft = {
   initialTemplateKey: "NON_API_NEW_ORDER", reminderTemplateKey: "NON_API_REMINDER", escalationTemplateKey: "NON_API_ESCALATION",
   appointmentTemplateKey: "NON_API_APPOINTMENT_REMINDER", appointmentRemindersEnabled: true, quietWindowMinutes: "10",
   slaBreachAlertsEnabled: true, slaBreachMaxPerOrder: "2",
+  dailyDigestEnabled: false, dailyDigestAt: "19:00", dailyDigestSkipWhenEmpty: true,
 };
 
 const TEMPLATE_OPTIONS = [
@@ -71,6 +80,9 @@ function toDraft(lab: LabConfig): Draft {
     quietWindowMinutes: String(lab.quietWindowMinutes ?? 10),
     slaBreachAlertsEnabled: lab.slaBreachAlertsEnabled ?? true,
     slaBreachMaxPerOrder: String(lab.slaBreachMaxPerOrder ?? 2),
+    dailyDigestEnabled: lab.dailyDigestEnabled ?? false,
+    dailyDigestAt: `${String(lab.dailyDigestHour ?? 19).padStart(2, "0")}:${String(lab.dailyDigestMinute ?? 0).padStart(2, "0")}`,
+    dailyDigestSkipWhenEmpty: lab.dailyDigestSkipWhenEmpty ?? true,
   };
 }
 
@@ -219,6 +231,12 @@ export function NonApiLabConfigPanel() {
       quietWindowMinutes: Number(draft.quietWindowMinutes),
       slaBreachAlertsEnabled: draft.slaBreachAlertsEnabled,
       slaBreachMaxPerOrder: Number(draft.slaBreachMaxPerOrder),
+      dailyDigestEnabled: draft.dailyDigestEnabled,
+      // A blank time input must not save as 00:00 — that would move the digest
+      // to midnight without anyone asking for it.
+      dailyDigestHour: Number((draft.dailyDigestAt || "19:00").split(":")[0]),
+      dailyDigestMinute: Number((draft.dailyDigestAt || "19:00").split(":")[1]),
+      dailyDigestSkipWhenEmpty: draft.dailyDigestSkipWhenEmpty,
     };
     const response = await fetch(editingLabId ? `/api/non-api-labs/${editingLabId}` : "/api/non-api-labs", {
       method: editingLabId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
@@ -411,6 +429,11 @@ export function NonApiLabConfigPanel() {
                     {cfg.integrationType === "NON_API"
                       ? <span className="text-zinc-400">Confirm · {cfg.confirmationSlaMinutes}m / {cfg.reminderSlaMinutes}m / {cfg.escalationSlaMinutes}m</span>
                       : <span className="text-zinc-600">No confirmation workflow</span>}
+                    <span className={cfg.dailyDigestEnabled ? "text-emerald-400" : "text-zinc-600"}>
+                      {cfg.dailyDigestEnabled
+                        ? `Daily summary · ${String(cfg.dailyDigestHour).padStart(2, "0")}:${String(cfg.dailyDigestMinute).padStart(2, "0")}`
+                        : "No daily summary"}
+                    </span>
                   </div>
                 )}
               </td>
@@ -463,6 +486,25 @@ export function NonApiLabConfigPanel() {
                   <Field label="Max alerts per order"><input required type="number" min="1" max="20" value={draft.slaBreachMaxPerOrder} onChange={(e) => update("slaBreachMaxPerOrder", e.target.value)} className={inputClass} /></Field>
                 </div>
                 <p className="text-[11px] text-zinc-500 mt-1.5">One order can breach several task rules in a row. Further breaches are still recorded — this only caps how many reach the provider.</p>
+              </div>
+              <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+                <div className="text-xs font-medium text-zinc-300 mb-2">Daily summary <span className="font-normal text-zinc-500">— one message a day</span></div>
+                <label className="flex items-center gap-2 text-sm text-zinc-300">
+                  <input type="checkbox" checked={draft.dailyDigestEnabled} onChange={(e) => update("dailyDigestEnabled", e.target.checked)} className="accent-blue-500" />
+                  Send this lab a wrap-up of today and a preview of tomorrow
+                </label>
+                <div className="mt-3 max-w-[10rem]">
+                  <Field label="Send at (local time)">
+                    <input required type="time" value={draft.dailyDigestAt} onChange={(e) => update("dailyDigestAt", e.target.value)} className={inputClass} />
+                  </Field>
+                </div>
+                <label className="mt-3 flex items-center gap-2 text-sm text-zinc-300">
+                  <input type="checkbox" checked={draft.dailyDigestSkipWhenEmpty} onChange={(e) => update("dailyDigestSkipWhenEmpty", e.target.checked)} className="accent-blue-500" />
+                  Stay quiet on days with no orders
+                </label>
+                <p className="text-[11px] text-zinc-500 mt-1.5">
+                  Counts for today, then tomorrow&apos;s appointment list — the same numbers as the provider board, from the same query. Evening suits it: today is settled and tomorrow is still changeable. Wording lives in the <span className="text-zinc-400">Daily summary</span> template.
+                </p>
               </div><label className="flex items-center gap-2 text-sm text-zinc-300"><input type="checkbox" checked={draft.isActive} onChange={(e) => update("isActive", e.target.checked)} className="accent-blue-500" /> Enable automation for this lab</label>{error && <div className="rounded-md bg-rose-500/10 text-rose-300 text-sm px-3 py-2">{error}</div>}</div><div className="px-5 py-4 border-t border-zinc-800 flex justify-end gap-2"><button type="button" onClick={() => setOpen(false)} className="px-3 py-2 text-sm text-zinc-400 hover:text-zinc-200">Cancel</button><button disabled={saving} className="rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-60 text-white font-semibold text-sm px-4 py-2">{saving ? "Saving…" : "Save configuration"}</button></div></form></div></div>}
       {toast && <div className="fixed z-[60] left-1/2 bottom-6 -translate-x-1/2 rounded-lg bg-zinc-100 text-zinc-950 px-4 py-2 text-sm font-medium shadow-lg">{toast}</div>}
     </div>

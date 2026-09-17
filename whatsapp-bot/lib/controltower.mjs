@@ -738,7 +738,44 @@ export async function attachPollReason({ jid, senderJid, text }) {
   return r.rows[0] ?? null;
 }
 
+/**
+ * Return messages the gateway abandoned mid-send.
+ *
+ * drainOutbound marks a row SENDING before handing it to WhatsApp. If the
+ * process dies in that window — a crash, a logout, a stop — the row stays
+ * SENDING forever: the drain only ever selects QUEUED, so nothing retries it
+ * and nothing reports it. One such message sat unsent for 23 hours before an
+ * audit noticed.
+ *
+ * Anything still SENDING after `olderThanMinutes` cannot be in flight — a send
+ * takes seconds — so it is put back. `attempts` still guards against a message
+ * that fails forever.
+ */
+// Exported so a regression test can prove a dropped send comes back.
+export async function reclaimStalledSends({ olderThanMinutes = 5, maxAttempts = 5 } = {}) {
+  const r = await taskosQuery(
+    `UPDATE wa_outbound
+        SET status = CASE WHEN attempts >= $2
+                          THEN 'FAILED'::"WaOutboundStatus"
+                          ELSE 'QUEUED'::"WaOutboundStatus" END,
+            error  = CASE WHEN attempts >= $2
+                          THEN 'abandoned mid-send after ' || attempts || ' attempts'
+                          ELSE error END
+      WHERE status = 'SENDING'
+        AND "createdAt" < now() - ($1 || ' minutes')::interval
+      RETURNING id, attempts, status`,
+    [String(olderThanMinutes), maxAttempts]
+  );
+  for (const row of r.rows) {
+    console.log(`reclaimed stalled send ${row.id} -> ${row.status} (attempt ${row.attempts})`);
+  }
+  return r.rows.length;
+}
+
 export async function drainOutbound(send, { limit = 5, sendPoll = null } = {}) {
+  // Before taking new work, pick up anything a previous run dropped.
+  try { await reclaimStalledSends(); } catch (e) { console.error("reclaim:", e.message); }
+
   const rows = (await taskosQuery(
     `SELECT o.id, o."targetJid", o.text, o."groupId", o."quotedWaId", o."mentions", o."mediaMime", o."mediaName", o."mediaBytes", o."pollName", o."pollOptions", g."sendEnabled", g.subject
        FROM wa_outbound o LEFT JOIN wa_groups g ON g.id = o."groupId"

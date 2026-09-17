@@ -14,6 +14,8 @@ export const NON_API_REJECT_ASK_TEMPLATE = "NON_API_REJECT_ASK";
 
 export const PROVIDER_SLA_BREACH_TEMPLATE = "PROVIDER_SLA_BREACH";
 export const SLA_MILESTONE_BREACH_TEMPLATE = "PROVIDER_SLA_MILESTONE";
+// The once-a-day wrap-up. Not NON_API_*: any lab with a config can opt in.
+export const PROVIDER_DAILY_DIGEST_TEMPLATE = "PROVIDER_DAILY_DIGEST";
 
 // Order details every template may use. `lab_name` has always been supplied to
 // the renderer by workflow.ts but was missing from this list, so a template
@@ -44,6 +46,18 @@ const BREACH_VARIABLES = ["task_title", "breach_minutes", "breached_at"] as cons
 export const SLA_MILESTONE_VARIABLES = [
   "sla_milestone", "sla_deadline", "sla_overdue_by",
   "sla_attempt_no", "sla_attempts_remaining",
+] as const;
+
+// The digest vocabulary. Deliberately shares NOTHING with the order variables
+// above: a digest names no order, no patient and no appointment, so a body
+// that reached for {{order_id}} would render "undefined" for every lab every
+// evening. Keeping the sets disjoint makes that a save-time error instead.
+export const DIGEST_VARIABLES = [
+  "lab_name", "digest_date",
+  "today_total", "today_home", "today_centre", "today_collected",
+  "today_pending", "today_reports_pending", "today_cancelled", "today_unconfirmed",
+  "tomorrow_date", "tomorrow_total", "tomorrow_home", "tomorrow_centre",
+  "tomorrow_first", "tomorrow_unconfirmed", "tomorrow_schedule",
 ] as const;
 
 /** A message using any sla_* variable may only be attached to a breach step. */
@@ -155,6 +169,31 @@ export const DEFAULT_NON_API_REJECT_ASK_BODY = `Noted — order {{order_id}} ({{
 
 Please reply to this message with the reason, so we can reassign it quickly.`;
 
+// ── The daily digest ─────────────────────────────────────────────────────
+// Written to be read on a phone, at the end of a shift. Today first, because
+// the reader already lived it and only wants to check nothing is hanging;
+// tomorrow second and in more detail, because that is the part they can still
+// act on. The appointment list is the point of the whole message — a count
+// tells a lab how busy tomorrow is, the list tells them what to staff.
+export const DEFAULT_PROVIDER_DAILY_DIGEST_BODY = `*Daily summary — {{lab_name}}*
+{{digest_date}}
+
+*Today*
+Orders: {{today_total}} ({{today_home}} home, {{today_centre}} centre)
+Collected: {{today_collected}}
+Still to collect: {{today_pending}}
+Reports pending: {{today_reports_pending}}
+Awaiting your confirmation: {{today_unconfirmed}}
+
+*Tomorrow — {{tomorrow_date}}*
+Orders: {{tomorrow_total}} ({{tomorrow_home}} home, {{tomorrow_centre}} centre)
+First appointment: {{tomorrow_first}}
+Awaiting your confirmation: {{tomorrow_unconfirmed}}
+
+{{tomorrow_schedule}}
+
+Please reply here if anything on tomorrow's list cannot be covered.`;
+
 export const TEMPLATE_DEFAULTS: Record<string, { name: string; body: string }> = {
   [NON_API_NEW_ORDER_TEMPLATE]: { name: "Non-API lab: new order", body: DEFAULT_NON_API_NEW_ORDER_BODY },
   [NON_API_REMINDER_TEMPLATE]: { name: "Non-API lab: reminder", body: DEFAULT_NON_API_REMINDER_BODY },
@@ -165,6 +204,7 @@ export const TEMPLATE_DEFAULTS: Record<string, { name: string; body: string }> =
   [NON_API_REJECT_ASK_TEMPLATE]: { name: "Non-API lab: cannot fulfil — ask for a reason", body: DEFAULT_NON_API_REJECT_ASK_BODY },
   [PROVIDER_SLA_BREACH_TEMPLATE]: { name: "Any lab: SLA breached", body: DEFAULT_PROVIDER_SLA_BREACH_BODY },
   [SLA_MILESTONE_BREACH_TEMPLATE]: { name: "Any lab: milestone SLA missed", body: DEFAULT_SLA_MILESTONE_BREACH_BODY },
+  [PROVIDER_DAILY_DIGEST_TEMPLATE]: { name: "Any lab: daily summary (today & tomorrow)", body: DEFAULT_PROVIDER_DAILY_DIGEST_BODY },
 };
 
 export type NonApiTemplateKey = string;
@@ -243,6 +283,13 @@ const TEMPLATE_RULES: Record<string, TemplateRules> = {
   [SLA_MILESTONE_BREACH_TEMPLATE]: {
     allowed: [...ORDER_VARIABLES, ...SLA_MILESTONE_VARIABLES],
     required: ["order_id", "sla_milestone", "sla_overdue_by"],
+  },
+  // Only the two totals are mandatory. Everything else is a matter of how much
+  // detail a given provider wants in their evening message, and forcing the
+  // full set would stop anyone trimming it to two lines.
+  [PROVIDER_DAILY_DIGEST_TEMPLATE]: {
+    allowed: DIGEST_VARIABLES,
+    required: ["today_total", "tomorrow_total"],
   },
 };
 
