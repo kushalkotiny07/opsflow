@@ -11,7 +11,27 @@
 import { useEffect, useState } from "react";
 import { SlaDeadlinesPanel } from "./SlaDeadlinesPanel";
 
-type Lab = { labId: number; labName: string; isActive: boolean; integrationType: "API" | "NON_API" };
+type LabConfig = { isActive: boolean; integrationType: "API" | "NON_API"; waGroupJid: string | null; whatsappNumber: string | null };
+type Lab = { labId: number; labName: string; configured: boolean; config: LabConfig | null };
+
+/** Same priority as the table above: NON_API, then candidates, then API. */
+function focusRank(lab: Lab) {
+  if (lab.config?.integrationType === "API") return 2;
+  if (lab.configured) return 0;
+  return 1;
+}
+
+/**
+ * Can a deadline set here actually reach this lab?
+ *
+ * Milestone rows may be stored for ANY lab id, but breach-engine only sends to
+ * a lab whose config is active and has a WhatsApp target. Without this the
+ * picker would happily let someone tune deadlines for a lab that can never be
+ * messaged, and nothing would say why nothing happened.
+ */
+function canReceive(lab: Lab) {
+  return !!lab.config?.isActive && !!(lab.config.waGroupJid || lab.config.whatsappNumber);
+}
 
 export function SlaDeadlinesSection() {
   const [labs, setLabs] = useState<Lab[]>([]);
@@ -19,13 +39,21 @@ export function SlaDeadlinesSection() {
 
   useEffect(() => {
     let cancelled = false;
-    void fetch("/api/non-api-labs")
+    // The full LabStack roster, not just configured labs — otherwise a lab the
+    // operator can see in the table above is missing from this picker.
+    void fetch("/api/non-api-labs/catalog")
       .then((res) => res.json())
       .then((data) => {
         if (cancelled) return;
         const loaded: Lab[] = data.labs ?? [];
         setLabs(loaded);
-        setLabId((current) => current ?? loaded.find((lab) => lab.isActive)?.labId ?? loaded[0]?.labId ?? null);
+        // Default to a lab that can actually be messaged.
+        setLabId((current) =>
+          current
+          ?? loaded.find((l) => canReceive(l) && l.config?.integrationType === "NON_API")?.labId
+          ?? loaded.find(canReceive)?.labId
+          ?? loaded[0]?.labId
+          ?? null);
       })
       .catch(() => {});
     return () => { cancelled = true; };
@@ -43,9 +71,11 @@ export function SlaDeadlinesSection() {
           onChange={(event) => setLabId(Number(event.target.value))}
           className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-200"
         >
-          {labs.map((item) => (
+          {[...labs].sort((a, b) => focusRank(a) - focusRank(b) || a.labName.localeCompare(b.labName)).map((item) => (
             <option key={item.labId} value={item.labId}>
-              {item.labName} ({item.integrationType})
+              {item.labName}
+              {item.config ? ` (${item.config.integrationType})` : ""}
+              {!item.configured ? " — not configured" : !canReceive(item) ? " — paused" : ""}
             </option>
           ))}
         </select>
@@ -53,6 +83,13 @@ export function SlaDeadlinesSection() {
           Milestone chasing works the same for API and non-API providers.
         </span>
       </div>
+      {!canReceive(lab) && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-300/90">
+          {lab.configured
+            ? `${lab.labName} is paused or has no WhatsApp target, so these deadlines are saved but no breach message will be sent.`
+            : `${lab.labName} has no provider configuration yet, so these deadlines are saved but no breach message will be sent. Configure it in the table above first.`}
+        </div>
+      )}
       <SlaDeadlinesPanel key={lab.labId} labId={lab.labId} labName={lab.labName} />
     </div>
   );

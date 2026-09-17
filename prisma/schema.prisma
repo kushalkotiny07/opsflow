@@ -994,6 +994,12 @@ model WaOutbound {
   mediaMime   String? // when set, this outbound carries an attachment
   mediaName   String? // original filename (documents)
   mediaBytes  Bytes? // the attachment bytes (short-lived; sent then done)
+  // When set, the gateway sends a WhatsApp POLL instead of a plain text body —
+  // how a provider answers accept / reschedule / cannot-fulfil without a link.
+  // pollOptions is [{ label, action }] in display order; the gateway copies it
+  // onto the WaPoll row so an incoming vote maps back to a LabProviderActionType.
+  pollName    String?
+  pollOptions Json?
   createdAt   DateTime         @default(now())
   sentAt      DateTime?
 
@@ -1003,6 +1009,55 @@ model WaOutbound {
   @@index([status])
   @@index([ticketId])
   @@map("wa_outbound")
+}
+
+// One poll the gateway put in a provider group, and the vote that came back.
+//
+// This is the hand-off between the two processes. The gateway owns sending and
+// decryption (only it holds the WhatsApp session); the console owns the
+// workflow state machine. Rather than have the gateway call the app over HTTP —
+// which would drop votes whenever the app is restarting — a vote is recorded
+// here and the every-minute tick applies it.
+//
+// `messageJson` is the poll creation message as Baileys returned it. Poll votes
+// arrive encrypted and can only be opened with the original message's
+// `messageSecret`, so it has to survive a gateway restart.
+model WaPoll {
+  waMsgId    String  @id // the poll creation message id
+  outboundId String? @unique // the wa_outbound row that sent it
+  workflowId String? // the confirmation workflow this poll is asking about
+  // [{ label, action }] in display order. Votes come back as the option TEXT,
+  // so this is what turns "Cannot fulfil" into REJECT.
+  options     Json
+  messageJson Json
+
+  status      WaPollStatus           @default(PENDING)
+  // The option TEXT that was tapped. votedAction alone is not enough: an
+  // informational option has no action, and two options may share one, so the
+  // label is what identifies which reply to send.
+  votedLabel  String?
+  votedAction LabProviderActionType?
+  voterJid    String?
+  votedAt     DateTime?
+
+  // A poll tap carries no text, so REJECT/RESCHEDULE ask for a follow-up in the
+  // group. The gateway sets awaitingReason, then fills reason from that
+  // person's next message.
+  awaitingReason Boolean   @default(false)
+  reason         String?
+  reasonAt       DateTime? // when the provider sent it
+  // The vote is applied as soon as it lands, so reminders stop immediately;
+  // a reason that turns up afterwards is a second, separate write. This marks
+  // it done so the tick does not re-attach the same text every minute.
+  reasonAppliedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([workflowId])
+  @@index([awaitingReason])
+  @@map("wa_polls")
 }
 
 enum WaGatewayStatus {
@@ -1161,6 +1216,48 @@ enum LabProviderActionType {
   REJECT
 }
 
+// An editable poll: the question, the options, and what each option replies.
+//
+// Poll options used to be a hardcoded array and the reply to a tap a fixed
+// template chosen by action, which meant a new kind of poll — an SLA breach
+// asking "what is happening with this sample?" — needed code. This makes both
+// halves data: Ops writes the options and the acknowledgement for each one, and
+// any message that wants a poll names a definition by key.
+//
+// `options` is [{ label, action, ack }]:
+//   label   what the provider taps, and what the vote comes back as
+//   action  optional workflow effect (ACCEPT/RESCHEDULE/REJECT); null means the
+//           answer is informational — an SLA breach has no workflow to move
+//   ack     the reply sent when this option is chosen, with {{order_id}} etc.
+//
+// The resolved options are COPIED onto each wa_polls row when the poll is sent,
+// so editing a definition never changes what an already-sent poll means.
+model WaPollDefinition {
+  id       String  @id @default(cuid())
+  key      String  @unique // ORDER_CONFIRMATION, SLA_BREACH, or an Ops-made one
+  name     String // what this poll is called in the console
+  question String // the question WhatsApp shows above the options
+  isActive Boolean @default(true)
+  options  Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("wa_poll_definitions")
+}
+
+// Lifecycle of one poll the gateway put in a provider group.
+//   PENDING  — sent, nobody has voted yet
+//   VOTED    — the gateway decrypted a vote; the console has not applied it
+//   APPLIED  — the workflow state machine has consumed it
+// The gateway only ever writes PENDING → VOTED, the console only VOTED →
+// APPLIED, so neither can clobber the other's work.
+enum WaPollStatus {
+  PENDING
+  VOTED
+  APPLIED
+}
+
 enum LabEscalationStatus {
   OPEN
   NOTIFIED
@@ -1184,6 +1281,9 @@ enum LabOrderEventType {
   REMINDER_SUPPRESSED
   ESCALATION_TRIGGERED
   WORKFLOW_CANCELLED
+  // Something the provider told us that moves no state — an informational poll
+  // answer, or the note that follows one. Recorded so the desk can read it.
+  PROVIDER_NOTE
 }
 
 // Editable message content. The renderer validates every {{variable}} before

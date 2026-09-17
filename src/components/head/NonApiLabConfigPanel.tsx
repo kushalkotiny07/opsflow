@@ -75,13 +75,66 @@ function toDraft(lab: LabConfig): Draft {
 }
 
 async function requestLabs() {
-  const response = await fetch("/api/non-api-labs");
+  // The catalogue, not the configured list: every lab LabStack knows about,
+  // so a lab nobody has configured yet is visible instead of absent.
+  const response = await fetch("/api/non-api-labs/catalog");
   const data = await response.json().catch(() => ({}));
   return { response, data };
 }
 
+/** One lab as LabStack knows it, plus our config for it when there is one. */
+type CatalogRow = {
+  labId: number;
+  labName: string;
+  city: string | null;
+  sourceActive: boolean;
+  openOrders: number;
+  configured: boolean;
+  orphaned?: boolean;
+  config: LabConfig | null;
+  /** Best guess at this lab's WhatsApp group, or null when nothing is convincing. */
+  suggestedGroup: { jid: string; subject: string; score: number } | null;
+  /** The stored jid matches no group the gateway has ever seen — almost always a typo. */
+  unknownGroup?: boolean;
+};
+
+/** A WhatsApp group the gateway can actually see. */
+type WaGroupOption = { jid: string; subject: string; sendEnabled: boolean; active: boolean; labId: number | null };
+
+/** A lab is only "on" when it is configured AND switched on. */
+const isLive = (row: CatalogRow) => !!row.config?.isActive;
+
+/**
+ * Ordering, by how much attention the lab deserves right now.
+ *
+ * NON_API labs are the focus: they are the ones running the confirmation
+ * ladder, so they lead. An unconfigured lab comes next — it is a candidate,
+ * and configuring one defaults it to NON_API. API labs sort last: they already
+ * receive orders over the API and only ever get breach alerts, so there is far
+ * less to tune and they would otherwise push the interesting rows down.
+ */
+function focusRank(row: CatalogRow) {
+  if (row.config?.integrationType === "API") return 2;
+  if (row.configured) return 0;
+  return 1;
+}
+
+/** Name, id or city — whichever the person happens to remember. */
+function matches(row: CatalogRow, query: string) {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return row.labName.toLowerCase().includes(q)
+    || String(row.labId) === q
+    || (row.city ?? "").toLowerCase().includes(q);
+}
+
 export function NonApiLabConfigPanel() {
-  const [labs, setLabs] = useState<LabConfig[]>([]);
+  const [labs, setLabs] = useState<CatalogRow[]>([]);
+  const [groups, setGroups] = useState<WaGroupOption[]>([]);
+  const [query, setQuery] = useState("");
+  // Off by default: hiding rows by default is how a lab goes unnoticed. The
+  // sort already puts NON_API first; this is for when you want only them.
+  const [nonApiOnly, setNonApiOnly] = useState(false);
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [editingLabId, setEditingLabId] = useState<number | null>(null);
   const [open, setOpen] = useState(false);
@@ -94,7 +147,7 @@ export function NonApiLabConfigPanel() {
   const load = useCallback(async () => {
     try {
       const { response, data } = await requestLabs();
-      if (response.ok) setLabs(data.labs ?? []);
+      if (response.ok) { setLabs(data.labs ?? []); setGroups(data.groups ?? []); }
       else setError(data.error ?? "Could not load lab configuration");
     } catch {
       setError("Could not load lab configuration");
@@ -107,7 +160,7 @@ export function NonApiLabConfigPanel() {
     let cancelled = false;
     void requestLabs().then(({ response, data }) => {
       if (cancelled) return;
-      if (response.ok) setLabs(data.labs ?? []);
+      if (response.ok) { setLabs(data.labs ?? []); setGroups(data.groups ?? []); }
       else setError(data.error ?? "Could not load lab configuration");
       setLoading(false);
     }).catch(() => {
@@ -116,17 +169,42 @@ export function NonApiLabConfigPanel() {
     return () => { cancelled = true; };
   }, []);
 
-  function addLab() {
-    setEditingLabId(null); setDraft(EMPTY_DRAFT); setError(null); setOpen(true);
-  }
-
-  function editLab(lab: LabConfig) {
-    setEditingLabId(lab.labId); setDraft(toDraft(lab)); setError(null); setOpen(true);
+  /**
+   * Open the editor for a lab from the catalogue.
+   *
+   * There is no "add" path any more. A lab that has never been configured is
+   * still a real lab in LabStack, so its id and name are taken from there and
+   * only the parts OpsFlow owns are editable.
+   */
+  function editLab(row: CatalogRow) {
+    setEditingLabId(row.configured ? row.labId : null);
+    setDraft(row.config
+      ? toDraft(row.config)
+      : {
+          ...EMPTY_DRAFT,
+          labId: String(row.labId),
+          labName: row.labName,
+          // Prefilled from the gateway's own group list, so the commonest case
+          // needs no typing at all.
+          waGroupJid: row.suggestedGroup?.jid ?? "",
+        });
+    setError(null);
+    setOpen(true);
   }
 
   function update<K extends keyof Draft>(key: K, value: Draft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
   }
+
+  // NON_API first, then unconfigured candidates, then API. Within a group the
+  // live ones lead, so an active lab never hides below a paused one.
+  const visible = labs
+    .filter((row) => matches(row, query))
+    .filter((row) => !nonApiOnly || row.config?.integrationType !== "API")
+    .sort((a, b) =>
+      focusRank(a) - focusRank(b)
+      || Number(isLive(b)) - Number(isLive(a))
+      || a.labName.localeCompare(b.labName));
 
   async function save(event: FormEvent) {
     event.preventDefault(); setSaving(true); setError(null);
@@ -155,12 +233,72 @@ export function NonApiLabConfigPanel() {
     setOpen(false); flash(editingLabId ? "Provider configuration updated" : "Provider configured"); load();
   }
 
-  async function toggleActive(lab: LabConfig) {
-    const response = await fetch(`/api/non-api-labs/${lab.labId}`, {
-      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive: !lab.isActive }),
+  /**
+   * Flip a lab on or off.
+   *
+   * An unconfigured lab cannot simply be switched on: the validator requires a
+   * WhatsApp group or number before a config can exist at all, and a lab that
+   * is "active" with nowhere to send would fail silently every tick. So the
+   * switch opens the editor instead of pretending to work.
+   */
+  /**
+   * Set how a lab receives orders, straight from the table.
+   *
+   * The same choice lives in the edit dialog, but classifying a dozen labs one
+   * modal at a time is the slow way round — and this is the field that decides
+   * whether a lab gets the confirmation ladder at all, so it earns a place in
+   * the row.
+   *
+   * PUT merges over the stored config and re-validates, so switching to
+   * NON_API on a lab with no WhatsApp target is rejected by the same rule that
+   * governs the dialog rather than by a second copy of it here.
+   */
+  async function setIntegration(row: CatalogRow, integrationType: "API" | "NON_API") {
+    if (!row.configured || !row.config) {
+      editLab(row);
+      return;
+    }
+    if (row.config.integrationType === integrationType) return;
+
+    const previous = row.config.integrationType;
+    setLabs((current) => current.map((item) =>
+      item.labId === row.labId && item.config ? { ...item, config: { ...item.config, integrationType } } : item));
+
+    const response = await fetch(`/api/non-api-labs/${row.labId}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ integrationType }),
     });
-    if (!response.ok) return flash("Could not update lab status");
-    setLabs((current) => current.map((item) => item.labId === lab.labId ? { ...item, isActive: !item.isActive } : item));
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      setLabs((current) => current.map((item) =>
+        item.labId === row.labId && item.config ? { ...item, config: { ...item.config, integrationType: previous } } : item));
+      const details = data.details ? Object.values(data.details).join(" · ") : null;
+      return flash(details || data.error || "Could not change how this lab receives orders");
+    }
+    flash(integrationType === "NON_API"
+      ? `${row.labName} now gets the confirmation ladder`
+      : `${row.labName} set to API — breach alerts only`);
+  }
+
+  async function toggleActive(row: CatalogRow) {
+    if (!row.configured || !row.config) {
+      flash("Add a WhatsApp target first");
+      editLab(row);
+      return;
+    }
+    const next = !row.config.isActive;
+    // Optimistic: the switch should move under the finger, not after a round trip.
+    setLabs((current) => current.map((item) =>
+      item.labId === row.labId && item.config ? { ...item, config: { ...item.config, isActive: next } } : item));
+
+    const response = await fetch(`/api/non-api-labs/${row.labId}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive: next }),
+    });
+    if (!response.ok) {
+      setLabs((current) => current.map((item) =>
+        item.labId === row.labId && item.config ? { ...item, config: { ...item.config, isActive: !next } } : item));
+      return flash("Could not update lab status");
+    }
+    flash(next ? `${row.labName} is now active` : `${row.labName} paused`);
   }
 
   return (
@@ -171,14 +309,47 @@ export function NonApiLabConfigPanel() {
           <h1 className="text-2xl font-semibold tracking-tight text-zinc-100">Provider communication</h1>
           <p className="text-sm text-zinc-400 mt-1 max-w-2xl">Configure how OpsFlow talks to external labs over WhatsApp. Every lab can be told when one of its orders breaches an SLA; labs that are not API-integrated also get the order confirmation workflow. LabStack remains the source of truth for orders and lab records.</p>
         </div>
-        <button onClick={addLab} className="shrink-0 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold px-4 py-2">+ Configure lab</button>
+        {/* No "add lab" button: the roster is whatever LabStack has. */}
+        <div className="shrink-0 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setNonApiOnly((v) => !v)}
+            aria-pressed={nonApiOnly}
+            title="API labs only ever get breach alerts — hide them to focus on the confirmation ladder"
+            className={`rounded-lg border px-3 py-2 text-xs font-medium transition ${
+              nonApiOnly
+                ? "border-blue-500 bg-blue-500/10 text-blue-300"
+                : "border-zinc-700 text-zinc-400 hover:text-zinc-200"
+            }`}
+          >
+            Non-API only
+          </button>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search labs…"
+            className="w-56 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-blue-500"
+          />
+        </div>
       </div>
 
       <div className="grid grid-cols-4 gap-3 mb-5 max-md:grid-cols-2">
-        <Metric label="Configured labs" value={labs.length} />
-        <Metric label="Active automation" value={labs.filter((lab) => lab.isActive).length} tone="text-emerald-400" />
-        <Metric label="Breach alerts on" value={labs.filter((lab) => lab.isActive && lab.slaBreachAlertsEnabled).length} tone="text-emerald-400" />
-        <Metric label="Missing WhatsApp target" value={labs.filter((lab) => !lab.waGroupJid && !lab.whatsappNumber).length} tone={labs.some((lab) => !lab.waGroupJid && !lab.whatsappNumber) ? "text-amber-400" : "text-zinc-100"} />
+        <Metric label="Labs in LabStack" value={labs.length} />
+        {/* The number that matters: labs running the confirmation ladder. */}
+        <Metric
+          label="Non-API configured"
+          value={labs.filter((lab) => lab.config?.integrationType === "NON_API").length}
+        />
+        <Metric
+          label="Non-API active"
+          value={labs.filter((lab) => lab.config?.integrationType === "NON_API" && isLive(lab)).length}
+          tone="text-emerald-400"
+        />
+        <Metric
+          label="Not configured"
+          value={labs.filter((lab) => !lab.configured).length}
+          tone={labs.some((lab) => !lab.configured) ? "text-amber-400" : "text-zinc-100"}
+        />
       </div>
 
       <div className="rounded-xl border border-zinc-800 overflow-hidden">
@@ -186,15 +357,75 @@ export function NonApiLabConfigPanel() {
           <div className="text-[11px] uppercase tracking-wide text-zinc-500 font-semibold">Lab communication policy</div>
           <span className="text-xs text-zinc-500 ml-auto">Breach alerts apply to every active lab. The confirmation workflow runs for NON_API labs only.</span>
         </div>
-        {loading ? <div className="p-10 text-center text-sm text-zinc-500">Loading lab configuration…</div> : labs.length === 0 ? (
-          <div className="p-10 text-center"><p className="text-sm text-zinc-400">No provider configurations yet.</p><button onClick={addLab} className="mt-3 text-sm text-blue-400 hover:text-blue-300">Configure the first provider</button></div>
+        {loading ? <div className="p-10 text-center text-sm text-zinc-500">Loading labs from LabStack…</div> : visible.length === 0 ? (
+          <div className="p-10 text-center"><p className="text-sm text-zinc-400">{query ? `No lab matches “${query}”.` : "LabStack returned no labs."}</p></div>
         ) : <div className="overflow-x-auto"><table className="w-full text-sm">
-          <thead className="bg-zinc-950/70"><tr className="text-left text-[11px] uppercase tracking-wide text-zinc-500 border-b border-zinc-800"><th className="px-4 py-2.5">Lab</th><th className="px-3 py-2.5">WhatsApp target</th><th className="px-3 py-2.5">Sends</th><th className="px-3 py-2.5">Automation</th><th className="px-4 py-2.5 text-right">Actions</th></tr></thead>
-          <tbody>{labs.map((lab) => <tr key={lab.labId} className="border-b border-zinc-800/60 hover:bg-zinc-900/40"><td className="px-4 py-3"><div className="font-medium text-zinc-100">{lab.labName}</div><div className="font-mono text-[11px] text-zinc-500">Lab #{lab.labId} · {lab.integrationType}</div></td><td className="px-3 py-3">{lab.waGroupJid ? <><div className="text-zinc-300">Group</div><div className="font-mono text-[11px] text-zinc-500 break-all">{lab.waGroupJid}</div></> : lab.whatsappNumber ? <><div className="text-zinc-300">Direct</div><div className="font-mono text-[11px] text-zinc-500">{lab.whatsappNumber}</div></> : <span className="text-amber-400">Missing</span>}</td><td className="px-3 py-3 text-xs"><div className="flex flex-col gap-1"><span className={lab.slaBreachAlertsEnabled ? "text-emerald-400" : "text-zinc-600"}>{lab.slaBreachAlertsEnabled ? `SLA breach alerts · max ${lab.slaBreachMaxPerOrder}/order` : "No breach alerts"}</span>{lab.integrationType === "NON_API" ? <span className="text-zinc-400">Confirmation · {lab.confirmationSlaMinutes}m / {lab.reminderSlaMinutes}m / {lab.escalationSlaMinutes}m</span> : <span className="text-zinc-600">No confirmation workflow (API lab)</span>}</div></td><td className="px-3 py-3"><button onClick={() => toggleActive(lab)} className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${lab.isActive ? "bg-emerald-500/10 text-emerald-400" : "bg-zinc-800 text-zinc-500"}`}>{lab.isActive ? "Active" : "Paused"}</button></td><td className="px-4 py-3 text-right"><button onClick={() => editLab(lab)} className="text-xs text-blue-400 hover:text-blue-300 font-medium">Edit</button></td></tr>)}</tbody>
+          <thead className="bg-zinc-950/70"><tr className="text-left text-[11px] uppercase tracking-wide text-zinc-500 border-b border-zinc-800">
+            <th className="px-4 py-2.5">Lab</th>
+            <th className="px-3 py-2.5">Open orders</th>
+            <th className="px-3 py-2.5">Receives orders</th>
+            <th className="px-3 py-2.5">WhatsApp target</th>
+            <th className="px-3 py-2.5">Automation</th>
+            <th className="px-3 py-2.5">Active</th>
+            <th className="px-4 py-2.5 text-right">Config</th>
+          </tr></thead>
+          <tbody>{visible.map((row) => {
+            const cfg = row.config;
+            // API labs stay visible but recede: nothing here is tunable for
+            // them beyond breach alerts, so they should not compete for the eye.
+            const isApi = cfg?.integrationType === "API";
+            return (
+            <tr key={row.labId} className={`border-b border-zinc-800/60 hover:bg-zinc-900/40 ${isApi ? "opacity-60" : ""}`}>
+              <td className="px-4 py-3">
+                <div className="font-medium text-zinc-100">
+                  {row.labName}
+                  {cfg?.integrationType === "NON_API" && (
+                    <span className="ml-2 rounded-full bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-blue-300 align-middle">NON-API</span>
+                  )}
+                </div>
+                <div className="font-mono text-[11px] text-zinc-500">
+                  Lab #{row.labId}{row.city ? ` · ${row.city}` : ""}
+                  {row.orphaned && <span className="ml-1 text-amber-400">· not in LabStack</span>}
+                  {!row.sourceActive && !row.orphaned && <span className="ml-1 text-zinc-600">· inactive upstream</span>}
+                </div>
+              </td>
+              <td className="px-3 py-3 text-zinc-300">{row.openOrders}</td>
+              <td className="px-3 py-3">
+                <IntegrationPicker
+                  value={cfg?.integrationType ?? null}
+                  onPick={(next) => setIntegration(row, next)}
+                  labName={row.labName}
+                />
+              </td>
+              <td className="px-3 py-3">
+                {cfg?.waGroupJid ? <><div className={`text-xs ${row.unknownGroup ? "text-amber-400" : "text-zinc-300"}`}>{row.unknownGroup ? "⚠ Unknown group" : "Group"}</div><div className="font-mono text-[11px] text-zinc-500 break-all">{groups.find((g) => g.jid === cfg.waGroupJid)?.subject ?? cfg.waGroupJid}</div></>
+                  : cfg?.whatsappNumber ? <><div className="text-zinc-300 text-xs">Direct</div><div className="font-mono text-[11px] text-zinc-500">{cfg.whatsappNumber}</div></>
+                  : <span className="text-xs text-amber-400">Not set</span>}
+              </td>
+              <td className="px-3 py-3 text-xs">
+                {!cfg ? <span className="text-zinc-600">Not configured</span> : (
+                  <div className="flex flex-col gap-1">
+                    <span className={cfg.slaBreachAlertsEnabled ? "text-emerald-400" : "text-zinc-600"}>
+                      {cfg.slaBreachAlertsEnabled ? `Breach alerts · max ${cfg.slaBreachMaxPerOrder}/order` : "No breach alerts"}
+                    </span>
+                    {cfg.integrationType === "NON_API"
+                      ? <span className="text-zinc-400">Confirm · {cfg.confirmationSlaMinutes}m / {cfg.reminderSlaMinutes}m / {cfg.escalationSlaMinutes}m</span>
+                      : <span className="text-zinc-600">No confirmation workflow</span>}
+                  </div>
+                )}
+              </td>
+              <td className="px-3 py-3"><Toggle on={isLive(row)} disabled={!row.configured} onClick={() => toggleActive(row)} label={row.labName} /></td>
+              <td className="px-4 py-3 text-right">
+                <button onClick={() => editLab(row)} className="text-xs font-medium text-blue-400 hover:text-blue-300">
+                  {row.configured ? "Edit" : "Configure"}
+                </button>
+              </td>
+            </tr>);
+          })}</tbody>
         </table></div>}
       </div>
 
-      {open && <div className="fixed inset-0 z-50 bg-black/65 p-4 overflow-y-auto"><div className="max-w-xl mx-auto my-8 rounded-xl border border-zinc-700 bg-zinc-950 shadow-2xl"><form onSubmit={save}><div className="px-5 py-4 border-b border-zinc-800 flex justify-between items-center"><div><h2 className="font-semibold text-zinc-100">{editingLabId ? "Edit lab" : "Configure a lab"}</h2><p className="text-xs text-zinc-500 mt-0.5">This never modifies LabStack&apos;s source lab record.</p></div><button type="button" onClick={() => setOpen(false)} className="text-zinc-500 hover:text-zinc-200">✕</button></div><div className="p-5 space-y-4"><div className="grid grid-cols-3 gap-3"><Field label="Lab ID"><input required disabled={editingLabId !== null} type="number" min="1" value={draft.labId} onChange={(e) => update("labId", e.target.value)} className={inputClass} /></Field><div className="col-span-2"><Field label="Lab name"><input required value={draft.labName} onChange={(e) => update("labName", e.target.value)} className={inputClass} /></Field></div></div><div>
+      {open && <div className="fixed inset-0 z-50 bg-black/65 p-4 overflow-y-auto"><div className="max-w-xl mx-auto my-8 rounded-xl border border-zinc-700 bg-zinc-950 shadow-2xl"><form onSubmit={save}><div className="px-5 py-4 border-b border-zinc-800 flex justify-between items-center"><div><h2 className="font-semibold text-zinc-100">{editingLabId ? "Edit lab" : "Configure a lab"}</h2><p className="text-xs text-zinc-500 mt-0.5">This never modifies LabStack&apos;s source lab record.</p></div><button type="button" onClick={() => setOpen(false)} className="text-zinc-500 hover:text-zinc-200">✕</button></div><div className="p-5 space-y-4"><div className="grid grid-cols-3 gap-3"><Field label="Lab ID"><input disabled type="number" value={draft.labId} className={inputClass} /></Field><div className="col-span-2"><Field label="Lab name"><input disabled value={draft.labName} className={inputClass} /></Field></div></div><p className="text-[11px] text-zinc-500 -mt-1">Both come from LabStack and are read-only here. Everything below is OpsFlow&apos;s own configuration.</p><div>
                 <div className="text-xs font-medium text-zinc-300 mb-2">How does this lab receive orders?</div>
                 <div className="grid grid-cols-2 gap-2">
                   {([
@@ -212,7 +443,17 @@ export function NonApiLabConfigPanel() {
                     </button>
                   ))}
                 </div>
-              </div><Field label="WhatsApp group id"><input value={draft.waGroupJid} onChange={(e) => update("waGroupJid", e.target.value)} placeholder="120363000000000000@g.us" className={inputClass} /></Field><p className="text-[11px] text-zinc-500 -mt-2">The provider&apos;s ops group, so a reply is visible to their whole desk. Required for API labs too — that is where breach alerts go. Sending stays off until the group is enabled under Settings → WhatsApp.</p><Field label="Lab WhatsApp number (fallback, used only without a group)"><input value={draft.whatsappNumber} onChange={(e) => update("whatsappNumber", e.target.value)} placeholder="+9198…" className={inputClass} /></Field><div className={draft.integrationType === "API" ? "opacity-40" : undefined}><div className="text-xs font-medium text-zinc-300 mb-2">Confirmation workflow {draft.integrationType === "API" && <span className="font-normal text-zinc-500">— not used: this lab receives orders through the API</span>}</div><div className="text-[11px] text-zinc-500 mb-2">SLA (minutes)</div><div className="grid grid-cols-3 gap-3"><Field label="Confirm"><input required type="number" min="1" value={draft.confirmationSlaMinutes} onChange={(e) => update("confirmationSlaMinutes", e.target.value)} className={inputClass} /></Field><Field label="Reminder"><input required type="number" min="1" value={draft.reminderSlaMinutes} onChange={(e) => update("reminderSlaMinutes", e.target.value)} className={inputClass} /></Field><Field label="Escalate"><input required type="number" min="1" value={draft.escalationSlaMinutes} onChange={(e) => update("escalationSlaMinutes", e.target.value)} className={inputClass} /></Field></div><p className="text-[11px] text-zinc-500 mt-1.5">Must progress from confirmation → reminder → escalation. No reminder is ever scheduled after the appointment.</p></div><div className={draft.integrationType === "API" ? "opacity-40" : undefined}><div className="text-xs font-medium text-zinc-300 mb-2">Appointment clock</div><label className="flex items-center gap-2 text-sm text-zinc-300"><input type="checkbox" checked={draft.appointmentRemindersEnabled} onChange={(e) => update("appointmentRemindersEnabled", e.target.checked)} className="accent-blue-500" /> Chase unconfirmed orders as the appointment approaches (T‑24h, T‑2h, T‑30m, T‑10m)</label><div className="mt-3 max-w-[12rem]"><Field label="Quiet window (minutes)"><input required type="number" min="0" max="240" value={draft.quietWindowMinutes} onChange={(e) => update("quietWindowMinutes", e.target.value)} className={inputClass} /></Field></div><p className="text-[11px] text-zinc-500 mt-1.5">Minimum gap between two confirmation messages about one order, across both clocks. Only a T‑10m reminder may break it. Breach alerts use the per-order cap below instead.</p></div><div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+              </div><Field label="WhatsApp group"><select value={draft.waGroupJid} onChange={(e) => update("waGroupJid", e.target.value)} className={inputClass}>
+                <option value="">— no group —</option>
+                {!!draft.waGroupJid && !groups.some((g) => g.jid === draft.waGroupJid) && (
+                  <option value={draft.waGroupJid}>⚠ {draft.waGroupJid} — not a group the gateway can see</option>
+                )}
+                {groups.map((g) => (
+                  <option key={g.jid} value={g.jid}>
+                    {g.subject || g.jid}{g.sendEnabled ? "" : " — sending off"}
+                  </option>
+                ))}
+              </select></Field><p className="text-[11px] text-zinc-500 -mt-2">Picked from the {groups.length} groups the gateway can actually see, so the id is never typed. A group still needs sending switched on under Settings &rarr; WhatsApp before anything leaves.</p><p className="text-[11px] text-zinc-500 -mt-2">The provider&apos;s ops group, so a reply is visible to their whole desk. Required for API labs too — that is where breach alerts go. Sending stays off until the group is enabled under Settings → WhatsApp.</p><Field label="Lab WhatsApp number (fallback, used only without a group)"><input value={draft.whatsappNumber} onChange={(e) => update("whatsappNumber", e.target.value)} placeholder="+9198…" className={inputClass} /></Field><div className={draft.integrationType === "API" ? "opacity-40" : undefined}><div className="text-xs font-medium text-zinc-300 mb-2">Confirmation workflow {draft.integrationType === "API" && <span className="font-normal text-zinc-500">— not used: this lab receives orders through the API</span>}</div><div className="text-[11px] text-zinc-500 mb-2">SLA (minutes)</div><div className="grid grid-cols-3 gap-3"><Field label="Confirm"><input required type="number" min="1" value={draft.confirmationSlaMinutes} onChange={(e) => update("confirmationSlaMinutes", e.target.value)} className={inputClass} /></Field><Field label="Reminder"><input required type="number" min="1" value={draft.reminderSlaMinutes} onChange={(e) => update("reminderSlaMinutes", e.target.value)} className={inputClass} /></Field><Field label="Escalate"><input required type="number" min="1" value={draft.escalationSlaMinutes} onChange={(e) => update("escalationSlaMinutes", e.target.value)} className={inputClass} /></Field></div><p className="text-[11px] text-zinc-500 mt-1.5">Must progress from confirmation → reminder → escalation. No reminder is ever scheduled after the appointment.</p></div><div className={draft.integrationType === "API" ? "opacity-40" : undefined}><div className="text-xs font-medium text-zinc-300 mb-2">Appointment clock</div><label className="flex items-center gap-2 text-sm text-zinc-300"><input type="checkbox" checked={draft.appointmentRemindersEnabled} onChange={(e) => update("appointmentRemindersEnabled", e.target.checked)} className="accent-blue-500" /> Chase unconfirmed orders as the appointment approaches (T‑24h, T‑2h, T‑30m, T‑10m)</label><div className="mt-3 max-w-[12rem]"><Field label="Quiet window (minutes)"><input required type="number" min="0" max="240" value={draft.quietWindowMinutes} onChange={(e) => update("quietWindowMinutes", e.target.value)} className={inputClass} /></Field></div><p className="text-[11px] text-zinc-500 mt-1.5">Minimum gap between two confirmation messages about one order, across both clocks. Only a T‑10m reminder may break it. Breach alerts use the per-order cap below instead.</p></div><div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
                 <div className="text-xs font-medium text-zinc-300 mb-2">SLA breach alerts <span className="font-normal text-emerald-400/80">— applies to every lab</span></div>
                 <label className="flex items-center gap-2 text-sm text-zinc-300">
                   <input type="checkbox" checked={draft.slaBreachAlertsEnabled} onChange={(e) => update("slaBreachAlertsEnabled", e.target.checked)} className="accent-blue-500" />
@@ -225,6 +466,90 @@ export function NonApiLabConfigPanel() {
               </div><label className="flex items-center gap-2 text-sm text-zinc-300"><input type="checkbox" checked={draft.isActive} onChange={(e) => update("isActive", e.target.checked)} className="accent-blue-500" /> Enable automation for this lab</label>{error && <div className="rounded-md bg-rose-500/10 text-rose-300 text-sm px-3 py-2">{error}</div>}</div><div className="px-5 py-4 border-t border-zinc-800 flex justify-end gap-2"><button type="button" onClick={() => setOpen(false)} className="px-3 py-2 text-sm text-zinc-400 hover:text-zinc-200">Cancel</button><button disabled={saving} className="rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-60 text-white font-semibold text-sm px-4 py-2">{saving ? "Saving…" : "Save configuration"}</button></div></form></div></div>}
       {toast && <div className="fixed z-[60] left-1/2 bottom-6 -translate-x-1/2 rounded-lg bg-zinc-100 text-zinc-950 px-4 py-2 text-sm font-medium shadow-lg">{toast}</div>}
     </div>
+  );
+}
+
+/**
+ * How a lab receives orders, as a two-way choice in the row.
+ *
+ * This is the field that decides whether a lab gets the confirmation ladder,
+ * so it is worth setting without opening a dialog. An unconfigured lab shows
+ * "Set up" instead: there is no config to PATCH yet, and one cannot be created
+ * without a WhatsApp target, so the click hands over to the editor.
+ */
+function IntegrationPicker({
+  value,
+  onPick,
+  labName,
+}: {
+  value: "API" | "NON_API" | null;
+  onPick: (next: "API" | "NON_API") => void;
+  labName: string;
+}) {
+  if (!value) {
+    return (
+      <button
+        type="button"
+        onClick={() => onPick("NON_API")}
+        className="rounded border border-dashed border-zinc-700 px-2 py-1 text-[11px] text-zinc-500 hover:border-blue-500 hover:text-blue-300"
+      >
+        Set up
+      </button>
+    );
+  }
+  const options = [
+    { key: "NON_API" as const, label: "WhatsApp", hint: `${labName} gets the confirmation ladder and breach alerts` },
+    { key: "API" as const, label: "API", hint: `${labName} already receives orders over the API — breach alerts only` },
+  ];
+  return (
+    <div className="inline-flex rounded-md border border-zinc-700 overflow-hidden" role="group" aria-label={`How ${labName} receives orders`}>
+      {options.map((option) => (
+        <button
+          key={option.key}
+          type="button"
+          title={option.hint}
+          aria-pressed={value === option.key}
+          onClick={() => onPick(option.key)}
+          className={`px-2 py-1 text-[11px] font-medium transition ${
+            value === option.key
+              ? option.key === "NON_API"
+                ? "bg-blue-500/15 text-blue-300"
+                : "bg-zinc-700/60 text-zinc-200"
+              : "text-zinc-500 hover:text-zinc-300"
+          }`}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Active switch.
+ *
+ * Disabled until the lab is configured, because a lab with no WhatsApp target
+ * cannot be activated — the config validator rejects it. Clicking the disabled
+ * switch still opens the editor rather than doing nothing, which is why the
+ * wrapper stays clickable and only the visual reads as inert.
+ */
+function Toggle({ on, disabled, onClick, label }: { on: boolean; disabled?: boolean; onClick: () => void; label: string }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      aria-label={`${on ? "Deactivate" : "Activate"} ${label}`}
+      title={disabled ? "Configure a WhatsApp target first" : on ? "Active — click to pause" : "Paused — click to activate"}
+      onClick={onClick}
+      className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${
+        on ? "bg-emerald-500" : disabled ? "bg-zinc-800" : "bg-zinc-700"
+      }`}
+    >
+      <span
+        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${on ? "translate-x-[1.15rem]" : "translate-x-1"} ${disabled ? "opacity-50" : ""}`}
+      />
+    </button>
   );
 }
 

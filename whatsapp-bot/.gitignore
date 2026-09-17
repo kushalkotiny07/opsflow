@@ -1,5 +1,10 @@
 node_modules/
+# Linked-device credentials. `auth/` alone was not enough: ./run-gateway.sh
+# relink retires a dead session to auth.loggedout.<timestamp>/, and those
+# directories carry the same private keys — enough to impersonate the account.
 auth/
+auth.*/
+auth-*/
 .env
 # runtime data / logs — may contain patient PII or personal group names. Never commit.
 out/
@@ -10,3 +15,6 @@ all-groups.txt
 last-qr.txt
 qr.png
 *.out
+# Supervisor bookkeeping — pids of a process that is long gone by the time
+# anyone reads them.
+*.pid

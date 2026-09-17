@@ -136,7 +136,7 @@ export function newBlock(kind: BlockKind): Block {
   }
 }
 
-/** Human labels for the block palette. */
+/** Human labels. Covers every kind, including ones no longer offered. */
 export const BLOCK_LABELS: Record<BlockKind, string> = {
   heading: "Heading",
   field: "Field",
@@ -144,6 +144,17 @@ export const BLOCK_LABELS: Record<BlockKind, string> = {
   text: "Text",
   spacer: "Blank line",
 };
+
+/**
+ * What the palette offers.
+ *
+ * "action" is deliberately absent: providers now answer by tapping the poll
+ * that rides with every confirmation message, so a link is a worse version of
+ * something they already have. The KIND still exists and still parses — bodies
+ * written before the change keep rendering, and an action block already in a
+ * message stays editable — but there is no longer a way to add a new one.
+ */
+export const ADDABLE_BLOCK_KINDS: readonly BlockKind[] = ["heading", "field", "text", "spacer"];
 
 export function moveBlock(blocks: Block[], index: number, direction: -1 | 1): Block[] {
   const target = index + direction;

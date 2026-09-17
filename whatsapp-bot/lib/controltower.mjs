@@ -66,19 +66,42 @@ export async function gatewayUpsert(fields) {
     ["default", ...keys.map((k) => fields[k])]
   );
 }
-export const setQr = (qr) => gatewayUpsert({ status: "QR", qr, qrUpdatedAt: new Date() });
+/**
+ * A timestamp these columns can store correctly.
+ *
+ * The timestamp columns are naive (`WITHOUT time zone`) and hold UTC by
+ * convention. Handing node-postgres a Date makes it serialize in the process's
+ * local zone ("…T13:28:23+05:30"); Postgres then DISCARDS that offset and keeps
+ * the literal wall-clock, storing IST. An explicit ISO string is already UTC,
+ * so the value that lands is the one we meant. See lib/taskosdb.mjs.
+ */
+export const utcNow = () => new Date().toISOString();
+
+export const setQr = (qr) => gatewayUpsert({ status: "QR", qr, qrUpdatedAt: utcNow() });
 export const setConnected = (number) =>
-  gatewayUpsert({ status: "CONNECTED", connectedNumber: number, qr: null, lastSeenAt: new Date() });
+  gatewayUpsert({ status: "CONNECTED", connectedNumber: number, qr: null, lastSeenAt: utcNow() });
 export const setStatus = (status) => gatewayUpsert({ status });
 export const heartbeat = (dryRun = null) =>
-  gatewayUpsert(dryRun === null ? { lastSeenAt: new Date() } : { lastSeenAt: new Date(), dryRun });
+  gatewayUpsert(dryRun === null ? { lastSeenAt: utcNow() } : { lastSeenAt: utcNow(), dryRun });
 
 // admin command (RELINK / LOGOUT) — read once and clear
+/**
+ * Read and clear the pending admin command.
+ *
+ * Returns the time it was requested as well as the command, because WHEN it was
+ * asked for decides whether it still means anything. A RELINK queued while the
+ * gateway was down is a request to get back online; running it after the
+ * gateway has since linked logs the fresh session straight out again — which
+ * is exactly the loop that kept the console showing no QR: no QR, click
+ * "Re-link", the link succeeds, the stale RELINK kills it, still no QR.
+ * See the connectedAt check in index.mjs.
+ */
 export async function consumeCommand() {
-  const r = await taskosQuery(`SELECT command FROM wa_gateway WHERE id = 'default'`);
-  const cmd = r.rows[0]?.command || null;
-  if (cmd) await taskosQuery(`UPDATE wa_gateway SET command = NULL, "commandRequestedAt" = NULL WHERE id = 'default'`);
-  return cmd;
+  const r = await taskosQuery(`SELECT command, "commandRequestedAt" FROM wa_gateway WHERE id = 'default'`);
+  const command = r.rows[0]?.command || null;
+  const requestedAt = r.rows[0]?.commandRequestedAt || null;
+  if (command) await taskosQuery(`UPDATE wa_gateway SET command = NULL, "commandRequestedAt" = NULL WHERE id = 'default'`);
+  return { command, requestedAt };
 }
 
 // ── ticket helpers ─────────────────────────────────────────────────────────
@@ -612,9 +635,112 @@ function signText(text) {
   return body ? `${body}\n\n_${SIGNATURE}_` : `_${SIGNATURE}_`;
 }
 
-export async function drainOutbound(send, { limit = 5 } = {}) {
+/**
+ * Send the poll that belongs to an outbound row and remember it.
+ *
+ * The stored `messageJson` is not bookkeeping: WhatsApp poll votes are
+ * encrypted against the poll creation message's own `messageSecret`, so without
+ * the original message a vote can never be opened — including after a gateway
+ * restart, which is exactly when a provider is most likely to have answered.
+ *
+ * `options` is stored per-poll rather than read from config at vote time, so
+ * relabelling an option later cannot change what an old poll's votes mean.
+ */
+async function recordPoll(row, sendPoll) {
+  let options = [];
+  try {
+    options = Array.isArray(row.pollOptions) ? row.pollOptions : JSON.parse(row.pollOptions || "[]");
+  } catch { options = []; }
+  const labels = options.map((o) => o?.label).filter(Boolean);
+  if (labels.length < 2) return; // a poll needs something to choose between
+
+  const msg = await sendPoll(row.targetJid, row.pollName, labels);
+  const waMsgId = msg?.key?.id;
+  if (!waMsgId) throw new Error("poll sent but no message id came back");
+
+  // The confirmation workflow this poll is asking about, via the communication
+  // row the scheduler linked to this outbound.
+  const workflowId = (await taskosQuery(
+    `SELECT "workflowId" FROM lab_communications WHERE "waOutboundId" = $1 AND "workflowId" IS NOT NULL LIMIT 1`,
+    [row.id]
+  )).rows[0]?.workflowId ?? null;
+
+  await taskosQuery(
+    `INSERT INTO wa_polls ("waMsgId", "outboundId", "workflowId", options, "messageJson", status, "createdAt", "updatedAt")
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, 'PENDING', now(), now())
+     ON CONFLICT ("waMsgId") DO NOTHING`,
+    [waMsgId, row.id, workflowId, JSON.stringify(options), JSON.stringify(msg)]
+  );
+}
+
+/** The poll creation message for a given id, or null if we never sent it. */
+export async function getPoll(waMsgId) {
+  return (await taskosQuery(
+    `SELECT "waMsgId", "workflowId", options, "messageJson", status, "votedAction"
+       FROM wa_polls WHERE "waMsgId" = $1 LIMIT 1`, [waMsgId]
+  )).rows[0] ?? null;
+}
+
+/**
+ * Record a decrypted vote.
+ *
+ * Deliberately only PENDING → VOTED: a provider who taps a second option has
+ * changed their mind after we already told the workflow, and silently
+ * overwriting an applied answer would desync the two. The first answer stands
+ * and the desk can see the rest in the group.
+ *
+ * REJECT and RESCHEDULE set awaitingReason, which makes the next message from
+ * that person in that chat get captured as the reason — a poll tap carries no
+ * text of its own.
+ */
+export async function recordPollVote(waMsgId, action, voterJid, label = null) {
+  // The LABEL is what identifies the reply — an informational option has no
+  // action, and two options may share one. Kept alongside the action so the
+  // console can find the exact option the provider tapped.
+  //
+  // Anything that is not a plain acceptance invites a written follow-up: a
+  // reschedule needs a time, a rejection needs a reason, and an informational
+  // answer ("Delayed") is only useful with the detail behind it.
+  const needsReason = action !== "ACCEPT";
+  const r = await taskosQuery(
+    `UPDATE wa_polls
+        SET status='VOTED', "votedAction"=$2, "votedLabel"=$5, "voterJid"=$3, "votedAt"=now(),
+            "awaitingReason"=$4, "updatedAt"=now()
+      WHERE "waMsgId"=$1 AND status='PENDING'
+      RETURNING "workflowId"`,
+    [waMsgId, action || null, voterJid || null, needsReason, label]
+  );
+  return r.rows[0] ?? null;
+}
+
+/**
+ * Attach a follow-up reason to the most recent poll in this chat that is still
+ * waiting for one from this sender.
+ *
+ * Scoped to the voter so an unrelated person chatting in the group cannot have
+ * their message recorded as the lab's reason.
+ */
+export async function attachPollReason({ jid, senderJid, text }) {
+  if (!text?.trim()) return null;
+  const r = await taskosQuery(
+    `UPDATE wa_polls SET reason=$3, "reasonAt"=now(), "awaitingReason"=false, "updatedAt"=now()
+      WHERE "waMsgId" = (
+        SELECT p."waMsgId" FROM wa_polls p
+          JOIN wa_outbound o ON o.id = p."outboundId"
+         WHERE p."awaitingReason" = true
+           AND o."targetJid" = $1
+           AND ($2::text IS NULL OR p."voterJid" IS NULL OR p."voterJid" = $2)
+         ORDER BY p."votedAt" DESC NULLS LAST LIMIT 1
+      )
+      RETURNING "waMsgId", "workflowId", "votedAction"`,
+    [jid, senderJid || null, text.trim().slice(0, 500)]
+  );
+  return r.rows[0] ?? null;
+}
+
+export async function drainOutbound(send, { limit = 5, sendPoll = null } = {}) {
   const rows = (await taskosQuery(
-    `SELECT o.id, o."targetJid", o.text, o."groupId", o."quotedWaId", o."mentions", o."mediaMime", o."mediaName", o."mediaBytes", g."sendEnabled", g.subject
+    `SELECT o.id, o."targetJid", o.text, o."groupId", o."quotedWaId", o."mentions", o."mediaMime", o."mediaName", o."mediaBytes", o."pollName", o."pollOptions", g."sendEnabled", g.subject
        FROM wa_outbound o LEFT JOIN wa_groups g ON g.id = o."groupId"
       WHERE o.status = 'QUEUED' ORDER BY o."createdAt" ASC LIMIT $1`, [limit]
   )).rows;
@@ -656,6 +782,13 @@ export async function drainOutbound(send, { limit = 5 } = {}) {
          WHERE "waOutboundId"=$1 AND status='QUEUED'`,
         [row.id]
       );
+      // A poll rides after the text, as its own message — WhatsApp has no way to
+      // attach options to a text body. Sent AFTER the row is marked SENT so a
+      // poll failure can never cause the message itself to be re-sent.
+      if (row.pollName && sendPoll) {
+        try { await recordPoll(row, sendPoll); }
+        catch (e) { console.error(`poll for outbound ${row.id}:`, e.message); }
+      }
       sent++;
     } catch (e) {
       await taskosQuery(`UPDATE wa_outbound SET status='FAILED', error=$2 WHERE id=$1`, [row.id, (e?.message || String(e)).slice(0, 300)]);

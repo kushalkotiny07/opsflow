@@ -5,6 +5,13 @@ export const NON_API_REMINDER_TEMPLATE = "NON_API_REMINDER";
 export const NON_API_ESCALATION_TEMPLATE = "NON_API_ESCALATION";
 export const NON_API_APPOINTMENT_TEMPLATE = "NON_API_APPOINTMENT_REMINDER";
 // Not NON_API_*: this one is sent to API labs too. See lib/provider-comms.
+// What the provider gets back the moment they tap a poll option. Until these
+// existed, Accept was answered with silence — the provider had no way to tell
+// whether the tap registered, which is the one thing a poll cannot show.
+export const NON_API_ACCEPTED_TEMPLATE = "NON_API_ACCEPTED";
+export const NON_API_RESCHEDULE_ASK_TEMPLATE = "NON_API_RESCHEDULE_ASK";
+export const NON_API_REJECT_ASK_TEMPLATE = "NON_API_REJECT_ASK";
+
 export const PROVIDER_SLA_BREACH_TEMPLATE = "PROVIDER_SLA_BREACH";
 export const SLA_MILESTONE_BREACH_TEMPLATE = "PROVIDER_SLA_MILESTONE";
 
@@ -15,7 +22,17 @@ const ORDER_VARIABLES = [
   "order_id", "patient_name", "appointment_date", "appointment_time",
   "location", "tests", "sla_deadline", "lab_name",
 ] as const;
+// Still rendered, and the tokens behind them are still minted — but no longer
+// present in any DEFAULT body. Providers answer by tapping the poll that rides
+// with the message; these remain so that links already sent keep working and so
+// Ops can still put one in a hand-edited template if they want a web form.
 const ACTION_URL_VARIABLES = ["accept_url", "reschedule_url", "reject_url"] as const;
+
+// The poll that replaces those links. Defined in ./poll-config, which has no
+// imports, so the message-flow editor ("use client") can read it without
+// pulling this module's Prisma import into the browser bundle. Re-exported here
+// because server callers reach for it alongside the template bodies.
+export { PROVIDER_POLL_NAME, PROVIDER_POLL_OPTIONS } from "./poll-config";
 // Only the breach template has these: they describe an OpsFlow task that blew
 // its deadline, which none of the confirmation-ladder messages know about.
 const BREACH_VARIABLES = ["task_title", "breach_minutes", "breached_at"] as const;
@@ -49,17 +66,13 @@ Tests: {{tests}}
 
 Please confirm by {{sla_deadline}}.
 
-Accept order: {{accept_url}}
-Reschedule: {{reschedule_url}}
-Cannot fulfil: {{reject_url}}`;
+Tap an option in the poll below to respond.`;
 
 export const DEFAULT_NON_API_REMINDER_BODY = `Reminder: please confirm LabStack order {{order_id}} for {{patient_name}}.
 Appointment: {{appointment_date}} at {{appointment_time}}
 Please confirm by {{sla_deadline}}.
 
-Accept: {{accept_url}}
-Reschedule: {{reschedule_url}}
-Cannot fulfil: {{reject_url}}`;
+Tap an option in the poll below to respond.`;
 
 // Addressed to the lab's manager, not the lab inbox that has already gone
 // quiet — hence {{manager_name}} and {{lab_name}}.
@@ -68,9 +81,7 @@ Patient: {{patient_name}}
 Appointment: {{appointment_date}} at {{appointment_time}}
 Please respond by {{sla_deadline}}.
 
-Accept: {{accept_url}}
-Reschedule: {{reschedule_url}}
-Cannot fulfil: {{reject_url}}`;
+Tap an option in the poll below to respond.`;
 
 // Appointment clock. This one is about the patient's clock, not the lab's SLA,
 // so it deliberately does not mention a confirmation deadline.
@@ -79,9 +90,7 @@ Patient: {{patient_name}}
 Appointment: {{appointment_date}} at {{appointment_time}}
 Location: {{location}}
 
-Accept: {{accept_url}}
-Reschedule: {{reschedule_url}}
-Cannot fulfil: {{reject_url}}`;
+Tap an option in the poll below to respond.`;
 
 // Deliberately carries no accept/reschedule/reject link. Those are bearer
 // tokens minted against a LabCommunicationWorkflow, and an API lab never has
@@ -124,11 +133,36 @@ export async function getActiveNewOrderTemplate() {
  * Shipped defaults. Exported so the block-editor round-trip test can assert
  * that opening any stock template in the builder does not rewrite it.
  */
+// ── Replies to a poll tap ────────────────────────────────────────────────
+// Accept repeats the order back deliberately. The provider tapped a button on
+// a message that may be well up their chat by now, so "confirmed" on its own
+// leaves them unsure WHICH order they just committed to.
+export const DEFAULT_NON_API_ACCEPTED_BODY = `*Order confirmed — thank you.*
+
+Order ID: {{order_id}}
+Patient: {{patient_name}}
+Appointment: {{appointment_date}} at {{appointment_time}}
+Location: {{location}}
+Tests: {{tests}}
+
+We have marked this order as accepted. No further confirmation is needed.`;
+
+export const DEFAULT_NON_API_RESCHEDULE_ASK_BODY = `Noted — reschedule requested for order {{order_id}} ({{patient_name}}).
+
+Please reply to this message with the date and time you can do instead, and we will update the order.`;
+
+export const DEFAULT_NON_API_REJECT_ASK_BODY = `Noted — order {{order_id}} ({{patient_name}}) marked as unable to fulfil.
+
+Please reply to this message with the reason, so we can reassign it quickly.`;
+
 export const TEMPLATE_DEFAULTS: Record<string, { name: string; body: string }> = {
   [NON_API_NEW_ORDER_TEMPLATE]: { name: "Non-API lab: new order", body: DEFAULT_NON_API_NEW_ORDER_BODY },
   [NON_API_REMINDER_TEMPLATE]: { name: "Non-API lab: reminder", body: DEFAULT_NON_API_REMINDER_BODY },
   [NON_API_ESCALATION_TEMPLATE]: { name: "Non-API lab: escalation (manager)", body: DEFAULT_NON_API_ESCALATION_BODY },
   [NON_API_APPOINTMENT_TEMPLATE]: { name: "Non-API lab: appointment reminder", body: DEFAULT_NON_API_APPOINTMENT_BODY },
+  [NON_API_ACCEPTED_TEMPLATE]: { name: "Non-API lab: order confirmed", body: DEFAULT_NON_API_ACCEPTED_BODY },
+  [NON_API_RESCHEDULE_ASK_TEMPLATE]: { name: "Non-API lab: reschedule — ask for a time", body: DEFAULT_NON_API_RESCHEDULE_ASK_BODY },
+  [NON_API_REJECT_ASK_TEMPLATE]: { name: "Non-API lab: cannot fulfil — ask for a reason", body: DEFAULT_NON_API_REJECT_ASK_BODY },
   [PROVIDER_SLA_BREACH_TEMPLATE]: { name: "Any lab: SLA breached", body: DEFAULT_PROVIDER_SLA_BREACH_BODY },
   [SLA_MILESTONE_BREACH_TEMPLATE]: { name: "Any lab: milestone SLA missed", body: DEFAULT_SLA_MILESTONE_BREACH_BODY },
 };

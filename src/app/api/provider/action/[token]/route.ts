@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/db/client";
 import { newRequestId, logAndBuildErrorBody } from "@/lib/observability/request-id";
+// Shared with the WhatsApp poll path so both answers land identically.
+// WorkflowClosedError carries message "WORKFLOW_CLOSED", which the catch below
+// already maps to a 409.
+import { applyProviderAction } from "@/lib/non-api-labs/provider-action";
 
 async function sha256(value: string) {
   const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -46,40 +50,22 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       });
       if (!actionToken || actionToken.action !== action) throw new Error("INVALID_ACTION_LINK");
       if (actionToken.usedAt || actionToken.expiresAt <= now) throw new Error("EXPIRED_ACTION_LINK");
-      if (["CANCELLED", "COMPLETED", "LAB_REJECTED"].includes(actionToken.workflow.status)) throw new Error("WORKFLOW_CLOSED");
 
+      // Burning the token and recording the answer must be one transaction, so
+      // the shared writer is handed this tx rather than opening its own.
       await tx.labProviderActionToken.update({ where: { id: actionToken.id }, data: { usedAt: now } });
-      await tx.labCommunicationWorkflow.update({
-        where: { id: actionToken.workflowId },
-        data: {
-          status: result.status,
-          acceptedAt: action === "ACCEPT" ? now : undefined,
-          rescheduleRequestedAt: action === "RESCHEDULE" ? now : undefined,
-          rejectedAt: action === "REJECT" ? now : undefined,
-          rejectionReason: action === "REJECT" ? (reason || "No reason provided") : undefined,
-        },
-      });
-      await tx.labCommunication.updateMany({
-        where: { workflowId: actionToken.workflowId, status: { in: ["QUEUED", "SENT", "DELIVERED", "READ"] } },
-        data: { status: "ACTION_TAKEN", actionTakenAt: now },
-      });
-      await tx.labCommunicationOrderEvent.create({
-        data: {
+      await applyProviderAction(
+        {
           workflowId: actionToken.workflowId,
-          type: result.event,
-          actorType: "LAB",
-          payload: { action, tokenId: actionToken.id, reason: reason || null, proposedAppointmentTime: proposedAppointmentTime || null },
-        },
-      });
-      await tx.labCommunicationAuditLog.create({
-        data: {
-          workflowId: actionToken.workflowId,
-          action: `LAB_${action}`,
-          actorType: "LAB",
+          action,
+          reason,
+          proposedAppointmentTime,
+          source: "TOKEN",
+          actorRef: actionToken.id,
           requestId,
-          metadata: { tokenId: actionToken.id, reason: reason || null, proposedAppointmentTime: proposedAppointmentTime || null },
         },
-      });
+        tx,
+      );
     });
 
     if (!contentType.includes("application/json")) {

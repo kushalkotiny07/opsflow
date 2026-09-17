@@ -25,7 +25,8 @@
     "wa:test-breach": "tsx prisma/test_provider_breach.ts",
     "wa:test-features": "tsx prisma/test_features_e2e.ts",
     "wa:test-cloud-api": "node scripts/test-whatsapp-cloud-api.mjs",
-    "wa:test-sla-milestone": "tsx prisma/test_sla_milestone_breach.ts"
+    "wa:test-sla-milestone": "tsx prisma/test_sla_milestone_breach.ts",
+    "wa:smoke": "node node_modules/.bin/tsx prisma/smoke_poll.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

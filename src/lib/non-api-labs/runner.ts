@@ -20,6 +20,7 @@
  */
 import { acquireLock, releaseLock, NON_API_LAB_LOCK_KEY } from "@/lib/engine/pollingLock";
 import { processDueNonApiLabScheduledActions } from "./scheduler";
+import { processPollVotes } from "./poll-votes";
 import { runSlaBreachTick } from "@/lib/provider-comms/breach-engine";
 
 const TICK_CRON = process.env.NON_API_LAB_TICK_CRON ?? "* * * * *";
@@ -32,6 +33,21 @@ export async function runNonApiLabTick(): Promise<void> {
   if (!acquired) return;
 
   try {
+    // Answers first. A provider who has already replied by poll should not be
+    // chased by a reminder this same tick, and applying the vote closes the
+    // workflow that the scheduler is about to look at.
+    try {
+      const votes = await processPollVotes();
+      if (votes.applied || votes.reasonsAttached || votes.skipped || votes.failed) {
+        console.log(
+          `[PollVotes] applied=${votes.applied} reasons=${votes.reasonsAttached} ` +
+          `skipped=${votes.skipped} failed=${votes.failed}`,
+        );
+      }
+    } catch (error) {
+      console.error("[PollVotes] Cycle error:", error);
+    }
+
     const stats = await processDueNonApiLabScheduledActions();
     const touched =
       stats.processed || stats.suppressed || stats.deferred || stats.rescheduled ||

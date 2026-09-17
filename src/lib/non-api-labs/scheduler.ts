@@ -2,7 +2,11 @@ import { Prisma } from "@prisma/client";
 import prisma from "@/lib/db/client";
 import { hasWhatsAppTarget, resolveLabTarget } from "./target";
 import { fetchOrderSnapshotsByIds } from "@/lib/engine/labstack";
-import { ensureTemplate, isNonApiTemplateKey, renderLabTemplate, type TemplateVariables } from "./templates";
+import {
+  ensureTemplate, isNonApiTemplateKey, renderLabTemplate,
+  type TemplateVariables,
+} from "./templates";
+import { resolvePoll, ORDER_CONFIRMATION_POLL } from "./poll-definitions";
 import { arbitrate, recomputeAppointmentRungs, rungDefinition, tokenExpiryFor } from "./ladder";
 import { classifySourceOrder } from "./source-check";
 import { toCommunicationRule } from "./rule-store";
@@ -48,7 +52,9 @@ function actionUrl(token: string) {
 
 const TIME_ZONE = () => process.env.TIMEZONE || "Asia/Kolkata";
 
-function formatDate(value: Date | string): string {
+// Exported so the poll acknowledgement renders dates identically to the
+// message it is replying to.
+export function formatDate(value: Date | string): string {
   const date = typeof value === "string" ? new Date(value) : value;
   return new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: TIME_ZONE() }).format(date);
 }
@@ -58,7 +64,7 @@ function formatDate(value: Date | string): string {
  * time only, so a template reading "{{appointment_date}} at {{appointment_time}}"
  * repeated the date in every reminder.
  */
-function formatTime(value: Date | string): string {
+export function formatTime(value: Date | string): string {
   const date = typeof value === "string" ? new Date(value) : value;
   return new Intl.DateTimeFormat("en-IN", { hour: "numeric", minute: "2-digit", timeZone: TIME_ZONE() }).format(date);
 }
@@ -625,6 +631,9 @@ async function sendForAction(
     reject_url: actionUrl(rawTokens[2].token),
   };
   const message = renderLabTemplate(template.body, variables);
+  // Outside the transaction: this only reads, and a slow read should not hold
+  // the write open.
+  const confirmationPoll = await resolvePoll(ORDER_CONFIRMATION_POLL);
 
   await prisma.$transaction(async (tx) => {
     await tx.labProviderActionToken.createMany({
@@ -639,6 +648,13 @@ async function sendForAction(
     const communication = await tx.labCommunication.create({
       data: {
         workflowId: workflow.id,
+        // Denormalized from the workflow so this row can be found the way
+        // every caller actually looks: by lab and by order. Without them a
+        // reminder was reachable only via workflowId, so per-lab history and
+        // anything counting messages for an order silently skipped the whole
+        // ladder — INITIAL_NOTIFICATION set them, REMINDER/ESCALATION did not.
+        labId: workflow.labId,
+        orderId: workflow.orderId,
         type: isEscalation ? "ESCALATION" : "REMINDER",
         recipient,
         templateKey,
@@ -653,7 +669,23 @@ async function sendForAction(
     const outbound = await tx.waOutbound.create({
       // groupId is what arms the gateway's sendEnabled guard for group
       // targets; a bare jid with no groupId would bypass it entirely.
-      data: { targetJid: target.targetJid, text: message, groupId: target.groupId },
+      //
+      // The poll rides along so the provider answers by tapping rather than
+      // opening a link. The gateway sends the text and the poll as two
+      // messages, records the poll on a WaPoll row, and a vote comes back
+      // through the every-minute tick. A DM target gets one too — polls work in
+      // a one-to-one chat as well.
+      data: {
+        targetJid: target.targetJid,
+        text: message,
+        groupId: target.groupId,
+        // Resolved from the editable definition, and SNAPSHOTTED onto the row:
+        // editing the poll later must not change what an already-sent poll
+        // means when its vote comes back.
+        ...(confirmationPoll
+          ? { pollName: confirmationPoll.question, pollOptions: confirmationPoll.options }
+          : {}),
+      },
     });
 
     await tx.labCommunication.update({

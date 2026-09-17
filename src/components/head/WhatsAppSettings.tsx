@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-type Gateway = { status: string; online: boolean; connectedNumber: string | null; qrDataUrl: string | null; lastSeenAt: string | null };
+type Gateway = { status: string; online: boolean; connectedNumber: string | null; qrDataUrl: string | null; lastSeenAt: string | null; gatewayLive?: boolean };
 type Group = { id: string; jid: string; subject: string; role: string; storeId: number | null; labId: number | null; active: boolean; sendEnabled: boolean; autoAskIdOnMissing: boolean };
 
 const ROLES = [
@@ -95,11 +95,28 @@ export function WhatsAppSettings() {
         </div>
         {needsScan && (
           <div className="mt-4 flex gap-5 items-center rounded-lg border border-dashed border-zinc-700 p-4 bg-zinc-900/60">
-            {gw?.qrDataUrl ? <img src={gw.qrDataUrl} alt="WhatsApp QR" width={180} height={180} className="rounded bg-white p-2" /> : <div className="w-[180px] h-[180px] grid place-items-center text-zinc-600 text-xs">Generating QR…</div>}
+            {gw?.qrDataUrl
+              ? <img src={gw.qrDataUrl} alt="WhatsApp QR" width={180} height={180} className="rounded bg-white p-2" />
+              : (
+                // A stale QR means the gateway stopped: the row still holds the
+                // last code it pushed, but that code expired seconds later and
+                // scanning it can only fail. Saying so beats "Generating QR…"
+                // forever, which is what this showed while nothing was running.
+                <div className="w-[180px] h-[180px] grid place-items-center rounded border border-dashed border-zinc-700 px-3 text-center text-xs text-zinc-500">
+                  {gw && gw.gatewayLive === false
+                    ? <span>The gateway is not running,<br />so no QR is being produced.</span>
+                    : <span>Generating QR…</span>}
+                </div>
+              )}
             <div className="text-sm text-zinc-300">
               <div className="font-semibold text-zinc-100 mb-1">Scan to link</div>
               <p className="text-zinc-400 max-w-xs">On the ops phone: <b>WhatsApp → Settings → Linked Devices → Link a Device</b>, then scan this code.</p>
               <p className="text-xs text-zinc-500 mt-2">Refreshes automatically until the device connects.</p>
+              {gw && gw.gatewayLive === false && (
+                <p className="text-xs text-amber-400 mt-2">
+                  Start it on the server with <code className="font-mono">./run-gateway.sh start</code>, then this code refreshes on its own.
+                </p>
+              )}
             </div>
           </div>
         )}

@@ -35,6 +35,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ADDABLE_BLOCK_KINDS,
   BLOCK_LABELS,
   type Block,
   type BlockKind,
@@ -45,6 +46,9 @@ import {
   toBody,
   variablesIn,
 } from "@/lib/non-api-labs/blocks";
+// From poll-config, not templates: templates.ts imports Prisma and this is a
+// client component.
+import { PROVIDER_POLL_OPTIONS } from "@/lib/non-api-labs/poll-config";
 
 type Template = {
   key: string;
@@ -948,7 +952,7 @@ export function NonApiLabMessageFlow() {
 
                     <div className="flex flex-wrap items-center gap-1.5 pt-1">
                       <span className="text-[10px] uppercase tracking-wide text-zinc-600">Add</span>
-                      {(Object.keys(BLOCK_LABELS) as BlockKind[]).map((kind) => (
+                      {ADDABLE_BLOCK_KINDS.map((kind) => (
                         <button
                           key={kind}
                           onClick={() => edit([...blocks, newBlock(kind)])}
@@ -957,6 +961,32 @@ export function NonApiLabMessageFlow() {
                           + {BLOCK_LABELS[kind]}
                         </button>
                       ))}
+                    </div>
+
+                    {/* The reply mechanism is not a block, so without this the
+                        editor looks as though nothing collects an answer. */}
+                    <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+                      <div className="text-[11px] font-medium text-zinc-300">How the provider answers</div>
+                      <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
+                        A WhatsApp poll is sent with this message automatically — you do not add it here, and
+                        there is nothing to configure. The provider taps one option:
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {PROVIDER_POLL_OPTIONS.map((option) => (
+                          <span
+                            key={option.action}
+                            className="rounded-full border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-[11px] text-zinc-300"
+                          >
+                            {option.label}
+                          </span>
+                        ))}
+                      </div>
+                      <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
+                        The tap updates the order straight away and stops further chasing. For
+                        <span className="text-zinc-400"> Reschedule</span> and
+                        <span className="text-zinc-400"> Cannot fulfil</span>, the bot then asks in the group for
+                        the reason or a new time, and records whatever they reply.
+                      </p>
                     </div>
                   </div>
                 )}

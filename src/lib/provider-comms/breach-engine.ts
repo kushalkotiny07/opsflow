@@ -29,6 +29,7 @@
  * no in-memory timers, so a restart mid-cycle resumes exactly where it was.
  */
 import prisma from "@/lib/db/client";
+import { resolvePoll, SLA_BREACH_POLL } from "@/lib/non-api-labs/poll-definitions";
 import type { Prisma, SlaMilestone } from "@prisma/client";
 import { resolveLabTarget, hasWhatsAppTarget } from "@/lib/non-api-labs/target";
 import { ensureTemplate, renderLabTemplate, type TemplateVariables } from "@/lib/non-api-labs/templates";
@@ -383,8 +384,18 @@ export async function runSlaBreachTick(now: Date = new Date()): Promise<BreachTi
         // The one send path: a row on wa_outbound, drained by the gateway.
         // groupId is what arms the per-group sendEnabled guard; a bare jid
         // with a null groupId would slip straight past it.
+        // A breach asks the provider what is going on, so it carries a poll
+        // too. Its options are informational — there is no confirmation
+        // workflow to move — and, like the ladder's, they are snapshotted onto
+        // the row so editing the definition cannot change an answered poll.
+        const breachPoll = await resolvePoll(SLA_BREACH_POLL);
         const outbound = await prisma.waOutbound.create({
-          data: { targetJid: target.targetJid, text: body, groupId: target.groupId },
+          data: {
+            targetJid: target.targetJid,
+            text: body,
+            groupId: target.groupId,
+            ...(breachPoll ? { pollName: breachPoll.question, pollOptions: breachPoll.options } : {}),
+          },
           select: { id: true },
         });
         await prisma.slaBreachSend.update({ where: { id: send.id }, data: { waOutboundId: outbound.id } });
