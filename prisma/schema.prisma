@@ -1001,6 +1001,11 @@ model WaOutbound {
   pollName    String?
   pollOptions Json?
   createdAt   DateTime         @default(now())
+  // When the gateway began handing this row to WhatsApp. Distinct from
+  // createdAt, which is when it was queued: a row can sit QUEUED for hours
+  // behind a backlog or a disconnected gateway, so "has this send stalled?"
+  // can only be measured from here.
+  sendingAt   DateTime?
   sentAt      DateTime?
 
   ticket WaTicket? @relation(fields: [ticketId], references: [id])

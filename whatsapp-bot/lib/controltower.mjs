@@ -750,6 +750,13 @@ export async function attachPollReason({ jid, senderJid, text }) {
  * Anything still SENDING after `olderThanMinutes` cannot be in flight — a send
  * takes seconds — so it is put back. `attempts` still guards against a message
  * that fails forever.
+ *
+ * Measured from `sendingAt`, NOT `createdAt`. createdAt is when the row was
+ * QUEUED, which says nothing about how long the send has been running: a
+ * message that waited out a gateway outage is already older than the threshold
+ * the moment it starts sending, so it was born eligible to be reclaimed out
+ * from under an in-flight send. COALESCE covers rows queued before the column
+ * existed.
  */
 // Exported so a regression test can prove a dropped send comes back.
 export async function reclaimStalledSends({ olderThanMinutes = 5, maxAttempts = 5 } = {}) {
@@ -762,7 +769,10 @@ export async function reclaimStalledSends({ olderThanMinutes = 5, maxAttempts = 
                           THEN 'abandoned mid-send after ' || attempts || ' attempts'
                           ELSE error END
       WHERE status = 'SENDING'
-        AND "createdAt" < now() - ($1 || ' minutes')::interval
+        AND COALESCE("sendingAt", "createdAt") < now() - ($1 || ' minutes')::interval
+        -- A row that already has a WhatsApp id DID reach WhatsApp; requeuing it
+        -- would send it a second time, which is the thing this guard is for.
+        AND "sentWaMsgId" IS NULL
       RETURNING id, attempts, status`,
     [String(olderThanMinutes), maxAttempts]
   );
@@ -776,20 +786,46 @@ export async function drainOutbound(send, { limit = 5, sendPoll = null } = {}) {
   // Before taking new work, pick up anything a previous run dropped.
   try { await reclaimStalledSends(); } catch (e) { console.error("reclaim:", e.message); }
 
+  // Claim the batch ATOMICALLY — the update and the select are one statement.
+  //
+  // This used to be a plain SELECT, with each row marked SENDING one at a time
+  // inside the send loop below. drainOutbound runs on a 4-second setInterval
+  // that does not wait for the previous run, and a batch of five takes longer
+  // than four seconds, so the next tick fired mid-batch and re-selected every
+  // row the first pass had not reached yet. Both passes then sent them. That
+  // is how order 999404 reached the provider twice: it was last of four, so it
+  // sat QUEUED the longest with a send already under way.
+  //
+  // FOR UPDATE SKIP LOCKED is what makes a second drain step over rows this
+  // one has taken rather than queue up behind them.
   const rows = (await taskosQuery(
-    `SELECT o.id, o."targetJid", o.text, o."groupId", o."quotedWaId", o."mentions", o."mediaMime", o."mediaName", o."mediaBytes", o."pollName", o."pollOptions", g."sendEnabled", g.subject
-       FROM wa_outbound o LEFT JOIN wa_groups g ON g.id = o."groupId"
-      WHERE o.status = 'QUEUED' ORDER BY o."createdAt" ASC LIMIT $1`, [limit]
+    `WITH claimed AS (
+       UPDATE wa_outbound
+          SET status = 'SENDING', attempts = attempts + 1, "sendingAt" = now()
+        WHERE id IN (
+          SELECT id FROM wa_outbound
+           WHERE status = 'QUEUED'
+           ORDER BY "createdAt" ASC
+           LIMIT $1
+           FOR UPDATE SKIP LOCKED
+        )
+       RETURNING *
+     )
+     SELECT c.id, c."targetJid", c.text, c."groupId", c."quotedWaId", c."mentions",
+            c."mediaMime", c."mediaName", c."mediaBytes", c."pollName", c."pollOptions",
+            c."createdAt", g."sendEnabled", g.subject
+       FROM claimed c LEFT JOIN wa_groups g ON g.id = c."groupId"
+      ORDER BY c."createdAt" ASC`, [limit]
   )).rows;
   let sent = 0;
   for (const row of rows) {
     // a group target must be send-enabled; non-group (raw number) sends are allowed
+    // attempts was already incremented by the claim above.
     if (row.groupId && !row.sendEnabled) {
-      await taskosQuery(`UPDATE wa_outbound SET status='FAILED', error=$2, attempts=attempts+1 WHERE id=$1`,
+      await taskosQuery(`UPDATE wa_outbound SET status='FAILED', error=$2 WHERE id=$1`,
         [row.id, `sending disabled for group "${row.subject}"`]);
       continue;
     }
-    await taskosQuery(`UPDATE wa_outbound SET status='SENDING', attempts=attempts+1 WHERE id=$1`, [row.id]);
     try {
       // Build a quoted stub so the reply threads under the original message.
       // WhatsApp only renders a quote when the quoted message lives in the SAME

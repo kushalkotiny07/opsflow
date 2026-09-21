@@ -56,6 +56,7 @@ export const DIGEST_VARIABLES = [
   "lab_name", "digest_date",
   "today_total", "today_home", "today_centre", "today_collected",
   "today_pending", "today_reports_pending", "today_cancelled", "today_unconfirmed",
+  "today_schedule",
   "tomorrow_date", "tomorrow_total", "tomorrow_home", "tomorrow_centre",
   "tomorrow_first", "tomorrow_unconfirmed", "tomorrow_schedule",
 ] as const;
@@ -173,8 +174,9 @@ Please reply to this message with the reason, so we can reassign it quickly.`;
 // Written to be read on a phone, at the end of a shift. Today first, because
 // the reader already lived it and only wants to check nothing is hanging;
 // tomorrow second and in more detail, because that is the part they can still
-// act on. The appointment list is the point of the whole message — a count
-// tells a lab how busy tomorrow is, the list tells them what to staff.
+// act on. Each half carries its counts and then names the orders behind them —
+// a count tells a lab how busy a day is, the list tells them which orders, and
+// tomorrow's carries the address a dispatcher plans routes from.
 export const DEFAULT_PROVIDER_DAILY_DIGEST_BODY = `*Daily summary — {{lab_name}}*
 {{digest_date}}
 
@@ -184,6 +186,8 @@ Collected: {{today_collected}}
 Still to collect: {{today_pending}}
 Reports pending: {{today_reports_pending}}
 Awaiting your confirmation: {{today_unconfirmed}}
+
+{{today_schedule}}
 
 *Tomorrow — {{tomorrow_date}}*
 Orders: {{tomorrow_total}} ({{tomorrow_home}} home, {{tomorrow_centre}} centre)

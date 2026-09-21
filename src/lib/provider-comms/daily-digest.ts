@@ -120,26 +120,43 @@ function orderTypeLabel(orderType: string): string {
 }
 
 /**
- * Tomorrow's appointments as message lines.
+ * One day's appointments as message lines.
+ *
+ * Order reference first, then the patient, because that is the order a lab
+ * works in: they look the order up, then confirm whose it is. The lab's own
+ * reference leads when it has one — our internal id means nothing on their
+ * side of the conversation.
+ *
+ * `withAddress` is the difference between the two blocks. Today's list is a
+ * check against work already in hand, so the address would be noise; tomorrow's
+ * is what a dispatcher plans routes from, so it is the whole point.
  *
  * `total` is the day's real count, which may exceed what was fetched — the
  * tail is reported as a number rather than dropped, so a lab with thirty
  * pickups is never told about twelve and left to discover the rest.
  */
-export function scheduleBlock(orders: ScheduledOrder[], total: number, zone: string): string {
-  if (orders.length === 0) return "No appointments on tomorrow's list yet.";
+export function scheduleBlock(
+  orders: ScheduledOrder[],
+  total: number,
+  zone: string,
+  options: { heading: string; empty: string; withAddress?: boolean },
+): string {
+  if (orders.length === 0) return options.empty;
   const lines = orders.map((order) => {
     const parts = [
+      // Their reference if we have it, ours if we do not — never both, which
+      // reads as two different orders on a phone.
+      order.labOrderId ? `${order.labOrderId}` : `#${order.orderId}`,
+      order.patientName || "Name not on file",
       clock(order.appointmentTime, zone),
       orderTypeLabel(order.orderType),
-      order.patientName || `Order #${order.orderId}`,
     ];
-    if (order.location) parts.push(order.location);
+    if (options.withAddress && order.address) parts.push(order.address);
     return `• ${parts.join(" · ")}`;
   });
   const remaining = total - orders.length;
   if (remaining > 0) lines.push(`…and ${remaining} more — full list in LabStack.`);
-  return ["Tomorrow's appointments:", ...lines].join("\n");
+  return [options.heading, ...lines].join("\n");
 }
 
 // ── Due check ────────────────────────────────────────────────────────────
@@ -213,9 +230,20 @@ export async function buildDigest(config: NonApiLabConfig, zone: string): Promis
 
   // Only fetched when there is something to list — an empty day should cost
   // nothing on a nightly job that runs for every configured lab.
-  const schedule: ScheduledOrder[] = days.tomorrow.total > 0
-    ? await loadDaySchedule(config.labId, zone, 1, SCHEDULE_LIMIT)
-    : [];
+  const [todaySchedule, tomorrowSchedule] = await Promise.all([
+    days.today.total > 0 ? loadDaySchedule(config.labId, zone, 0, SCHEDULE_LIMIT) : Promise.resolve([] as ScheduledOrder[]),
+    days.tomorrow.total > 0 ? loadDaySchedule(config.labId, zone, 1, SCHEDULE_LIMIT) : Promise.resolve([] as ScheduledOrder[]),
+  ]);
+
+  /**
+   * The listable count for a day.
+   *
+   * Measured against the list's own basis: loadDaySchedule excludes
+   * cancellations and the day total includes them, so subtracting them is what
+   * keeps "…and N more" honest instead of inventing orders that were called off.
+   */
+  const listable = (counts: { total: number; cancelled: number }, listed: number) =>
+    Math.max(counts.total - counts.cancelled, listed);
 
   const count = (value: number) => String(value);
 
@@ -230,19 +258,23 @@ export async function buildDigest(config: NonApiLabConfig, zone: string): Promis
     today_reports_pending: count(days.today.reportPending),
     today_cancelled: count(days.today.cancelled),
     today_unconfirmed: count(unconfirmed.get(today) ?? 0),
+    today_schedule: scheduleBlock(todaySchedule, listable(days.today, todaySchedule.length), zone, {
+      heading: "Today's orders:",
+      empty: "No orders on today's list.",
+    }),
     tomorrow_date: dateLabel(tomorrow, false),
     tomorrow_total: count(days.tomorrow.total),
     tomorrow_home: count(days.tomorrow.homeCollections),
     tomorrow_centre: count(days.tomorrow.centreVisits),
     tomorrow_first: clock(days.tomorrow.firstAppointment, zone),
     tomorrow_unconfirmed: count(unconfirmed.get(tomorrow) ?? 0),
-    // The schedule count excludes cancellations, which the day total includes,
-    // so the "…and N more" tail is measured against the list's own basis.
-    tomorrow_schedule: scheduleBlock(
-      schedule,
-      Math.max(days.tomorrow.total - days.tomorrow.cancelled, schedule.length),
-      zone,
-    ),
+    // Addresses only here: tomorrow's list is what a dispatcher plans routes
+    // from, today's is a check against work already in hand.
+    tomorrow_schedule: scheduleBlock(tomorrowSchedule, listable(days.tomorrow, tomorrowSchedule.length), zone, {
+      heading: "Tomorrow's appointments:",
+      empty: "No appointments on tomorrow's list yet.",
+      withAddress: true,
+    }),
   };
 
   return { variables, hasContent: days.today.total > 0 || days.tomorrow.total > 0 };

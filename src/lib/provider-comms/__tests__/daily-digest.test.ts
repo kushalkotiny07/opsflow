@@ -49,39 +49,66 @@ describe("minutesPastSlot", () => {
 
 const order = (overrides: Partial<ScheduledOrder> = {}): ScheduledOrder => ({
   orderId: 101,
+  labOrderId: null,
   appointmentTime: new Date("2026-09-18T02:30:00Z"), // 08:00 IST
   orderType: "HOME_SAMPLE",
   orderStatus: "ORDER_SCHEDULED",
   patientName: "Varun Banaal",
   location: "Solan",
+  address: "Solan 173212",
   ...overrides,
 });
 
+const TODAY = { heading: "Today's orders:", empty: "No orders on today's list." };
+const TOMORROW = { heading: "Tomorrow's appointments:", empty: "No appointments on tomorrow's list yet.", withAddress: true };
+
 describe("scheduleBlock", () => {
   // renderLabTemplate throws on an empty variable, so an empty day must still
-  // produce a line — otherwise a quiet tomorrow breaks the whole message.
+  // produce a line — otherwise a quiet day breaks the whole message.
   it("never renders empty", () => {
-    assert.ok(scheduleBlock([], 0, IST).trim().length > 0);
+    assert.equal(scheduleBlock([], 0, IST, TODAY), TODAY.empty);
+    assert.equal(scheduleBlock([], 0, IST, TOMORROW), TOMORROW.empty);
   });
 
-  it("renders time, type, patient and location on one line", () => {
-    const block = scheduleBlock([order()], 1, IST);
-    assert.match(block, /8:00 am · Home · Varun Banaal · Solan/);
+  it("leads with the order reference, then the patient", () => {
+    const line = scheduleBlock([order()], 1, IST, TODAY).split("\n")[1];
+    assert.equal(line, "• #101 · Varun Banaal · 8:00 am · Home");
   });
 
-  it("names the order when the patient is unknown, rather than leaving a gap", () => {
-    const block = scheduleBlock([order({ patientName: null, location: null })], 1, IST);
-    assert.match(block, /Order #101/);
-    assert.doesNotMatch(block, /· ·/);
+  // Their reference, not ours, whenever the lab has one: our internal id means
+  // nothing on their side of the conversation.
+  it("prefers the lab's own order reference when there is one", () => {
+    const line = scheduleBlock([order({ labOrderId: "SVC-8891" })], 1, IST, TODAY).split("\n")[1];
+    assert.match(line, /^• SVC-8891 · Varun Banaal/);
+    assert.doesNotMatch(line, /#101/, "showing both ids reads as two different orders");
+  });
+
+  it("adds the address to tomorrow's list but not today's", () => {
+    assert.match(scheduleBlock([order()], 1, IST, TOMORROW), /Solan 173212/);
+    assert.doesNotMatch(scheduleBlock([order()], 1, IST, TODAY), /173212/);
+  });
+
+  it("says so when the name is missing, rather than leaving a gap", () => {
+    const line = scheduleBlock([order({ patientName: null })], 1, IST, TODAY);
+    assert.match(line, /#101 · Name not on file/);
+    assert.doesNotMatch(line, /· ·/);
+  });
+
+  it("holds the line together when tomorrow has no address on file", () => {
+    const line = scheduleBlock([order({ address: null })], 1, IST, TOMORROW).split("\n")[1];
+    assert.equal(line, "• #101 · Varun Banaal · 8:00 am · Home");
   });
 
   it("reports the tail it could not list instead of dropping it", () => {
-    const block = scheduleBlock([order(), order({ orderId: 102 })], 9, IST);
-    assert.match(block, /…and 7 more/);
+    assert.match(scheduleBlock([order(), order({ orderId: 102 })], 9, IST, TODAY), /…and 7 more/);
   });
 
   it("says nothing about a tail when the whole day fits", () => {
-    assert.doesNotMatch(scheduleBlock([order()], 1, IST), /more/);
+    assert.doesNotMatch(scheduleBlock([order()], 1, IST, TODAY), /more/);
+  });
+
+  it("puts the heading first, so the list is never a wall of bullets", () => {
+    assert.equal(scheduleBlock([order()], 1, IST, TOMORROW).split("\n")[0], TOMORROW.heading);
   });
 });
 

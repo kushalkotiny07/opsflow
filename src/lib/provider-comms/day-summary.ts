@@ -137,12 +137,36 @@ export async function loadDaySummaries(labIds: number[], zone: string): Promise<
 
 export type ScheduledOrder = {
   orderId: number;
+  /** The lab's OWN reference. What their staff search by, when it exists. */
+  labOrderId: string | null;
   appointmentTime: Date;
   orderType: string;
   orderStatus: string;
   patientName: string | null;
+  /** Short form — city, or the centre's name. */
   location: string | null;
+  /**
+   * The most precise location LabStack holds. Not a street address: the source
+   * has no such column, only city + pincode on the order and the centre's name
+   * and city. Composing them here keeps every caller from re-deciding which of
+   * the four fields to trust for which order type.
+   */
+  address: string | null;
 };
+
+/** City + pincode for a home visit; the centre and its city for a centre visit. */
+function composeAddress(row: {
+  orderType: string; city: string | null; pincode: string | null;
+  storeName: string | null; storeCity: string | null; userCity: string | null;
+}): string | null {
+  const parts = row.orderType === "CENTER_VISIT"
+    ? [row.storeName, row.storeCity ?? row.city]
+    // The order's own city beats the patient record's: a collection can be
+    // booked to an address the patient does not live at.
+    : [row.city ?? row.userCity, row.pincode];
+  const address = parts.filter(Boolean).join(row.orderType === "CENTER_VISIT" ? ", " : " ").trim();
+  return address || null;
+}
 
 /**
  * The actual appointments on one local day, earliest first.
@@ -158,14 +182,18 @@ export async function loadDaySchedule(
   limit: number,
 ): Promise<ScheduledOrder[]> {
   const rows = await labstackWorkerQuery<{
-    id: number; appointmentTime: Date; orderType: string; orderStatus: string;
-    patientName: string | null; city: string | null; storeName: string | null;
+    id: number; labOrderId: string | null; appointmentTime: Date; orderType: string; orderStatus: string;
+    patientName: string | null; city: string | null; pincode: string | null;
+    storeName: string | null; storeCity: string | null; userCity: string | null;
   }>(
     `
-    SELECT o.id, o."appointmentTime",
+    SELECT o.id, o."labOrderId", o."appointmentTime",
            o."orderType"::text   AS "orderType",
            o."orderStatus"::text AS "orderStatus",
-           u.name AS "patientName", u.city, s."storeName"
+           u.name AS "patientName",
+           o.city, o.pincode,
+           u.city AS "userCity",
+           s."storeName", s.city AS "storeCity"
       FROM public."Order" o
       LEFT JOIN public."User"  u ON u.id = o."userId"
       LEFT JOIN public."Store" s ON s.id = o."storeId"
@@ -183,10 +211,12 @@ export async function loadDaySchedule(
 
   return rows.map((row) => ({
     orderId: row.id,
+    labOrderId: row.labOrderId,
     appointmentTime: new Date(row.appointmentTime),
     orderType: row.orderType,
     orderStatus: row.orderStatus,
     patientName: row.patientName,
-    location: row.city || row.storeName || null,
+    location: row.city || row.userCity || row.storeName || null,
+    address: composeAddress(row),
   }));
 }

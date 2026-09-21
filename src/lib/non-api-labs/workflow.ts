@@ -10,6 +10,7 @@ import {
   renderLabTemplate,
   type TemplateVariables,
 } from "./templates";
+import { resolvePoll, ORDER_CONFIRMATION_POLL } from "./poll-definitions";
 import { buildLadder, tokenExpiryFor } from "./ladder";
 import { loadActiveCommunicationRules } from "./rule-store";
 import { planRuleActions, selectRulesFor } from "./rules";
@@ -171,6 +172,15 @@ export async function startNonApiLabWorkflow(order: RawOrder): Promise<WorkflowS
   // register the wa_groups row, and that lookup does not belong inside the
   // workflow's write transaction.
   const target = await resolveLabTarget(config);
+  // The poll the provider answers by tapping. Resolved here, outside the
+  // transaction, for the same reason as the target: it only reads.
+  //
+  // This message is the FIRST thing a provider sees about an order, and it has
+  // always ended with "Tap an option in the poll below to respond" — but the
+  // poll was only ever attached by scheduler.ts, so until a reminder fired
+  // there was nothing to tap. The provider was told to use a control that did
+  // not exist yet.
+  const confirmationPoll = await resolvePoll(ORDER_CONFIRMATION_POLL);
 
   const rendered = renderLabTemplate(template.body, {
     ...safeVariables,
@@ -212,6 +222,13 @@ export async function startNonApiLabWorkflow(order: RawOrder): Promise<WorkflowS
       const communication = await tx.labCommunication.create({
         data: {
           workflowId: workflow.id,
+          // Denormalized from the order, exactly as the ladder's messages do.
+          // Without them this row was reachable only through workflowId, so
+          // per-lab history and anything counting messages for an order — the
+          // breach path's per-order cap included — silently skipped the one
+          // message every order definitely gets.
+          labId: order.labId,
+          orderId: order.id,
           type: "INITIAL_NOTIFICATION",
           recipient: target.targetJid,
           templateKey: template.key,
@@ -222,7 +239,18 @@ export async function startNonApiLabWorkflow(order: RawOrder): Promise<WorkflowS
       const outbound = await tx.waOutbound.create({
         // Group targets must carry groupId — that is what the gateway's
         // per-group sendEnabled guard keys off.
-        data: { targetJid: target.targetJid, text: rendered, groupId: target.groupId },
+        //
+        // The poll rides along so the provider can answer by tapping. Its
+        // options are SNAPSHOTTED onto the row: editing the poll later must
+        // not change what an already-sent poll means when its vote comes back.
+        data: {
+          targetJid: target.targetJid,
+          text: rendered,
+          groupId: target.groupId,
+          ...(confirmationPoll
+            ? { pollName: confirmationPoll.question, pollOptions: confirmationPoll.options }
+            : {}),
+        },
       });
       await tx.labCommunication.update({ where: { id: communication.id }, data: { waOutboundId: outbound.id } });
 
