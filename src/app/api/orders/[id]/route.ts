@@ -107,14 +107,22 @@ export async function GET(
       status: true,
       priority: true,
       slaDeadline: true,
+      fix/smart-view-and-replica-guard
       // Both are declared on the drawer's OrderTask type and completedAt is
       // rendered ("Done HH:MM"), but neither was selected — so a completed
       // task silently showed no completion time.
       slaBreachedAt: true,
+
+ fix/smart-view-and-replica-guard
       completedAt: true,
       createdAt: true,
+      metadata: true,
       assignedTo: { select: { id: true, name: true } },
       taskType: { select: { label: true } },
+      checklistItems: {
+        orderBy: { stepOrder: "asc" },
+        select: { id: true, stepOrder: true, stepText: true, isRequired: true, isDone: true, guidance: true, script: true },
+      },
     },
     orderBy: [
       // ORDER tasks first (the drawer's primary subject), then anything else.

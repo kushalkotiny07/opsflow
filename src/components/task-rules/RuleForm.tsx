@@ -198,7 +198,7 @@ export default function RuleForm({ initialRule, onSuccess }: RuleFormProps) {
 
       {activeTab === 'checklist' && (
         <ChecklistEditor
-          taskTypeId={formData.taskTypeId ? Number(formData.taskTypeId) : null}
+          ruleId={initialRule?.id ?? null}
         />
       )}
     </div>

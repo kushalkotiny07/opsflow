@@ -13,9 +13,12 @@
 // node-cron imported dynamically below — webpackIgnore prevents webpack
 // from bundling its ESM files which use node:crypto/path/url.
 import prisma from "@/lib/db/client";
-import { probeLabstackHealthy } from "@/lib/db/labstack";
+import { probeLabstackHealthy, labstackWorker } from "@/lib/db/labstack";
 import { fetchAllActiveOrders, fetchActiveOrdersByStatus } from "./labstack";
+import type { TaskRuleWithRelations } from "@/types";
 import { evaluateAndCreateTasks, loadActiveRules, RuleCycleStats } from "./taskCreator";
+import { fetchSourceSample } from "./sourceSample";
+import { bareTableName } from "@/lib/validation/data-sources";
 import { runSourceHealthWatcher } from "./sourceHealthWatcher";
 import { runSlaWatcher } from "./slaWatcher";
 import { sendDailySummary } from "./dailySummary";
@@ -69,6 +72,124 @@ async function writeCheckpoint(sourceKey: string, seenAt: Date): Promise<void> {
   } catch (err) {
     console.error("[Poller] writeCheckpoint error:", err);
   }
+}
+
+// ── Non-Order source polling ────────────────────────────────────────────────
+// The legacy cycle only ever read the Order table, so rules on other sources
+// (Appointments, PharmaOrder, …) were loaded but evaluated against orders they
+// could never match — they never fired. This polls each non-Order source's own
+// table and evaluates ONLY that source's rules against its own entities.
+//
+// One unified cron still drives everything (this runs inside runPollCycle), so
+// we don't reintroduce the parallel per-source crons that got the standalone
+// multi-source engine disabled.
+
+// How far back to look for recently-touched entities. Wider than the Order
+// checkpoint window so staleness-triggered rules (minutesSinceStatusUpdated)
+// still see entities that haven't changed recently; dedup makes re-processing
+// cheap on steady state.
+const NON_ORDER_LOOKBACK_DAYS = 14;
+const NON_ORDER_SAMPLE_CAP = 2000;
+
+interface NonOrderPollStat {
+  sourceId: string;
+  displayName: string;
+  entitiesFound: number;
+  tasksCreated: number;
+  perRule: RuleCycleStats[];
+  status: "SUCCESS" | "ERROR";
+  errorMessage: string | null;
+}
+
+async function pollNonOrderSources(
+  rules: TaskRuleWithRelations[],
+  startedAt: Date,
+): Promise<NonOrderPollStat[]> {
+  const stats: NonOrderPollStat[] = [];
+  const sourceIds = Array.from(new Set(rules.map((r) => r.dataSourceId).filter(Boolean)));
+  if (sourceIds.length === 0) return stats;
+
+  const sources = await prisma.dataSource.findMany({
+    where: { id: { in: sourceIds }, isActive: true },
+    select: {
+      id: true, sourceId: true, displayName: true, tableReference: true,
+      primaryKeyField: true, typeFieldName: true, statusFieldName: true,
+      metadataFieldMapping: true,
+    },
+  });
+
+  const since = new Date(startedAt.getTime() - NON_ORDER_LOOKBACK_DAYS * 24 * 60 * 60_000);
+
+  for (const source of sources) {
+    // Order-source rules are handled by the legacy Order path; skip here.
+    if (bareTableName(source.tableReference) === "Order") continue;
+
+    const sourceRules = rules.filter((r) => r.dataSourceId === source.id);
+    if (sourceRules.length === 0) continue;
+
+    const stat: NonOrderPollStat = {
+      sourceId: source.sourceId,
+      displayName: source.displayName,
+      entitiesFound: 0,
+      tasksCreated: 0,
+      perRule: [],
+      status: "SUCCESS",
+      errorMessage: null,
+    };
+    const pollStartedAt = new Date();
+    try {
+      const entities = await fetchSourceSample(
+        {
+          tableReference: source.tableReference,
+          primaryKeyField: source.primaryKeyField,
+          typeFieldName: source.typeFieldName,
+          statusFieldName: source.statusFieldName,
+          metadataFieldMapping: (source.metadataFieldMapping as Record<string, string> | null) ?? null,
+        },
+        since,
+        NON_ORDER_SAMPLE_CAP,
+        labstackWorker,
+      );
+      stat.entitiesFound = entities.length;
+      if (entities.length > 0) {
+        const result = await evaluateAndCreateTasks(entities, sourceRules);
+        stat.tasksCreated = result.created;
+        stat.perRule = result.perRule;
+      }
+      console.log(
+        `[Poller] Source '${source.sourceId}': ${entities.length} entities, ${stat.tasksCreated} tasks created`,
+      );
+    } catch (err) {
+      stat.status = "ERROR";
+      stat.errorMessage = err instanceof Error ? err.message : String(err);
+      console.error(`[Poller] Source '${source.sourceId}' poll failed (non-fatal):`, stat.errorMessage);
+    }
+
+    // Mirror per-source poll activity so the Data Sources UI shows it, same as
+    // the Order path does in the cycle's finally block.
+    try {
+      await prisma.dataSourcePollingLog.create({
+        data: {
+          dataSourceId: source.id,
+          pollStartedAt,
+          pollCompletedAt: new Date(),
+          durationMs: Date.now() - pollStartedAt.getTime(),
+          entitiesFound: stat.entitiesFound,
+          entitiesProcessed: stat.entitiesFound,
+          tasksCreated: stat.tasksCreated,
+          tasksFailed: 0,
+          status: stat.status,
+          errorMessage: stat.errorMessage,
+        },
+      });
+    } catch (logErr) {
+      console.error(`[Poller] Failed to write DataSourcePollingLog for '${source.sourceId}':`, logErr);
+    }
+
+    stats.push(stat);
+  }
+
+  return stats;
 }
 
 // ── Core poll cycle ───────────────────────────────────────────────────────────
@@ -156,9 +277,29 @@ export async function runPollCycle(): Promise<void> {
     const rules = await loadActiveRules();
     console.log(`[Poller] ${rules.length} active task rules loaded`);
 
-    // 3. Evaluate rules → create tasks
-    if (orders.length > 0 && rules.length > 0) {
-      const result = await evaluateAndCreateTasks(orders, rules);
+    // 2b. Partition rules by source. The Order table is fetched in bulk above
+    //     (fetchAllActiveOrders); rules on other sources must NOT be evaluated
+    //     against order rows (they'd fail the type gate and never fire, and a
+    //     loosely-filtered one could even mint wrong order-tagged tasks). We
+    //     resolve each rule's source table and keep only Order-source rules on
+    //     the order path; the rest are polled per-source in step 3d.
+    const ruleSourceIds = Array.from(new Set(rules.map((r) => r.dataSourceId).filter(Boolean)));
+    const ruleSources = ruleSourceIds.length
+      ? await prisma.dataSource.findMany({
+          where: { id: { in: ruleSourceIds } },
+          select: { id: true, tableReference: true },
+        })
+      : [];
+    const orderSourceIds = new Set(
+      ruleSources.filter((s) => bareTableName(s.tableReference) === "Order").map((s) => s.id),
+    );
+    // A rule whose source is unknown/unresolved falls back to the order path
+    // (preserves legacy behaviour for the seeded 'orders' source).
+    const orderRules = rules.filter((r) => !r.dataSourceId || orderSourceIds.has(r.dataSourceId));
+
+    // 3. Evaluate ORDER rules → create tasks
+    if (orders.length > 0 && orderRules.length > 0) {
+      const result = await evaluateAndCreateTasks(orders, orderRules);
       tasksCreated = result.created;
       perRule = result.perRule;
       console.log(`[Poller] Tasks created: ${result.created}, skipped: ${result.skipped}`);
@@ -181,9 +322,9 @@ export async function runPollCycle(): Promise<void> {
     // re-run evaluateAndCreateTasks. Dedup in taskCreator skips orders
     // that already have an open task for the rule, so this is cheap on
     // steady state and only does real work when there's drift.
-    if (rules.length > 0) {
+    if (orderRules.length > 0) {
       const stalenessStatuses = new Set<string>();
-      for (const r of rules) {
+      for (const r of orderRules) {
         if (r.triggerType !== "TIME") continue;
         const c = (r.triggerCondition ?? {}) as Record<string, unknown>;
         const hasStaleness =
@@ -210,7 +351,7 @@ export async function runPollCycle(): Promise<void> {
         );
 
         if (newOrders.length > 0) {
-          const result2 = await evaluateAndCreateTasks(newOrders, rules);
+          const result2 = await evaluateAndCreateTasks(newOrders, orderRules);
           tasksCreated += result2.created;
           // Merge perRule counters: same rule ids on both runs, so add.
           const byId = new Map(perRule.map((s) => [s.ruleId, s]));
@@ -231,6 +372,21 @@ export async function runPollCycle(): Promise<void> {
           console.log(`[Poller] Second-pass tasks created: ${result2.created}, skipped: ${result2.skipped}`);
         }
       }
+    }
+
+    // 3d. Non-Order sources — poll each source's own table and evaluate its
+    //     own rules against its own entities (Appointments, PharmaOrder, …).
+    //     Per-source error isolation lives inside pollNonOrderSources so one
+    //     bad source can't fail the whole cycle. perRule entries carry distinct
+    //     rule ids, so we just append them for the PollingLog breakdown.
+    try {
+      const nonOrderStats = await pollNonOrderSources(rules, startedAt);
+      for (const s of nonOrderStats) {
+        tasksCreated += s.tasksCreated;
+        if (s.perRule.length) perRule = perRule.concat(s.perRule);
+      }
+    } catch (nonOrderErr) {
+      console.error("[Poller] Non-Order source polling failed (non-fatal):", nonOrderErr);
     }
 
     // W3 — archive duplicate removed. `archiveOldTasks` runs nightly via

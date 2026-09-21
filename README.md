@@ -1,36 +1,38 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# OpsFlow (TaskOs)
 
-## Getting Started
+OpsFlow is the LabStack Ops console: it watches operational data (orders,
+appointments, …) from a read-only source database, turns it into a live task
+board via configurable rules, auto-assigns work to agents, and tracks SLAs —
+plus a WhatsApp Control Tower for provider/store coordination.
 
-First, run the development server:
+Stack: **Next.js 15** (App Router) · **React 19** · **Prisma 4.16** ·
+**PostgreSQL 16** · **Node 20**.
+
+## Getting started
+
+👉 **[DOCS/LOCAL_SETUP.md](DOCS/LOCAL_SETUP.md)** — clone-to-running guide with a
+seeded database (Docker or native).
+
+Fastest path (Docker):
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.example .env                     # set JWT_SECRET (openssl rand -hex 32)
+docker compose up -d --build             # starts Postgres + app on :3000
+docker compose exec -T app npm run db:seed   # load starter data (rules, task types…)
+open http://localhost:3000               # login: admin@opsflow.local / changeme123
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Documentation
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- **[DOCS/LOCAL_SETUP.md](DOCS/LOCAL_SETUP.md)** — local setup, seeding, and the
+  two-database (taskos vs source) model.
+- **[DOCKER.md](DOCKER.md)** — Docker deep-dive: external/managed databases,
+  admin password reset, data persistence, troubleshooting.
+- **[AGENTS.md](AGENTS.md)** — this is a customised Next.js build; read before
+  touching framework-level code.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Environment
 
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+All variables are documented in **[.env.example](.env.example)**. The only one
+you must set is `JWT_SECRET`; `DATABASE_URL` defaults to the bundled Postgres
+and `SOURCE_DATABASE_URL` is optional (blank = UI-only, no live tasks).

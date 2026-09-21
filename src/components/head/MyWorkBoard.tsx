@@ -18,9 +18,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { formatISTTimestamp } from "@/lib/utils/timezone";
+import { createPortal } from "react-dom";
+import { formatISTTimestamp, titleToIST } from "@/lib/utils/timezone";
 import TaskDetailPanel from "@/components/agent/TaskDetailPanel";
 import OrderQuickView from "@/components/shared/OrderQuickView";
+import AppointmentQuickView from "@/components/shared/AppointmentQuickView";
 
 // ─── Types ─────────────────────────────────────────────────────────────
 interface Agent {
@@ -44,6 +46,10 @@ interface Task {
   status: string;
   priority: string;
   orderType: string;
+  // Source entity kind — "ORDER" (default/legacy), "APPOINTMENT", "PHARMAORDER"…
+  // Gates order-only framing (phlebo prep) so non-Order tasks don't get
+  // mislabelled "no phlebo yet".
+  entityType?: string;
   entityId: number;
   storeId: number | null;
   appointmentTime: string | null;
@@ -62,6 +68,9 @@ interface Task {
   // carry the sentinel taskRuleId "MANUAL" (see /api/tasks POST).
   taskRuleId: string;
   taskRule?: { name?: string } | null;
+  // Originating data source (flattened by /api/tasks) — powers the top-level
+  // Data Source filter. Null for manual/anchor tasks.
+  dataSource?: { id: string; sourceId: string; displayName: string } | null;
   // Computed by API:
   viewBucket: "today" | "tomorrow" | "stuck" | "future" | "done";
   urgencyBucket: number;
@@ -88,7 +97,10 @@ const PREP_VISIBILITY_HOUR_IST = 16; // 4 PM IST — when tonight's prep becomes
 const EARLY_MORNING_CUTOFF_HOUR_IST = 10; // appts before 10 AM count as "early"
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
-// ─── Order-type pill ───────────────────────────────────────────────────
+// ─── Entity-type pill ──────────────────────────────────────────────────
+// Covers Order types plus the other data sources now surfaced on the board
+// (Appointments: CENTER_VISIT / HOME_VISIT / ONLINE; PharmaOrder: PLACED-side
+// types). Unknown types fall back to a titled label instead of a raw slice.
 const TYPE_STYLES: Record<string, string> = {
   HOME_SAMPLE: "bg-blue-900/60 text-blue-300",
   CONSULTATION: "bg-purple-900/60 text-purple-300",
@@ -98,6 +110,10 @@ const TYPE_STYLES: Record<string, string> = {
   MRI: "bg-violet-900/60 text-violet-300",
   INJECTION: "bg-pink-900/60 text-pink-300",
   MANUAL: "bg-zinc-800 text-zinc-300",
+  // Appointment types
+  CENTER_VISIT: "bg-teal-900/60 text-teal-300",
+  HOME_VISIT: "bg-cyan-900/60 text-cyan-300",
+  ONLINE: "bg-indigo-900/60 text-indigo-300",
 };
 const TYPE_LABEL: Record<string, string> = {
   HOME_SAMPLE: "HSC",
@@ -106,12 +122,19 @@ const TYPE_LABEL: Record<string, string> = {
   RADIOLOGY: "RAD",
   INJECTION: "INJ",
   MANUAL: "MANUAL",
+  // Appointment types
+  CENTER_VISIT: "CENTER",
+  HOME_VISIT: "HOME",
+  ONLINE: "ONLINE",
 };
 function typeStyle(orderType: string) {
   return TYPE_STYLES[orderType] ?? "bg-zinc-800 text-zinc-300";
 }
 function typeLabel(orderType: string) {
-  return TYPE_LABEL[orderType] ?? orderType.slice(0, 6);
+  if (TYPE_LABEL[orderType]) return TYPE_LABEL[orderType];
+  // Unknown/other-source type: show the first token, spaces→nothing, cap at 8
+  // chars so a pill stays compact but readable (e.g. "PARTIAL_DELIVERED"→"PARTIAL").
+  return (orderType.split("_")[0] || orderType).slice(0, 8);
 }
 
 // ─── Time helpers ──────────────────────────────────────────────────────
@@ -139,6 +162,14 @@ function metaStr(t: Task, key: string): string {
 }
 function storeNameOf(t: Task): string {
   return metaStr(t, "storeName") || (t.storeId != null ? `Store #${t.storeId}` : "");
+}
+
+// Phlebo assignment is an Order-collection concept (a phlebotomist visits to
+// collect a sample). Appointment / other-source tasks have no phlebo, so the
+// "no phlebo yet" prep framing must not apply to them. Treat a missing
+// entityType as ORDER for legacy tasks created before entityType was stamped.
+function hasPhleboWorkflow(t: Task): boolean {
+  return (t.entityType ?? "ORDER") === "ORDER";
 }
 
 // ─── CSV export (client-side, mirrors the filtered view) ────────────────
@@ -220,6 +251,19 @@ function AssigneeChip({
 }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Flip the menu upward when the chip sits low in the viewport, so the
+  // agent list isn't clipped off the bottom of the panel.
+  const [dropUp, setDropUp] = useState(false);
+  const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const toggleOpen = () => {
+    if (!open && anchorRef.current) {
+      const r = anchorRef.current.getBoundingClientRect();
+      setAnchorRect(r);
+      setDropUp(window.innerHeight - r.bottom < 320);
+    }
+    setOpen((v) => !v);
+  };
 
   // Read-only mode for agents: render a static badge with no popover.
   if (!canReassign) {
@@ -265,10 +309,10 @@ function AssigneeChip({
   };
 
   return (
-    <div className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
+    <div ref={anchorRef} className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
       {task.assignedTo ? (
         <button
-          onClick={() => setOpen((v) => !v)}
+          onClick={toggleOpen}
           className="flex items-center gap-1.5 px-1.5 py-0.5 rounded hover:bg-zinc-700/50 transition-colors"
           title="Click to reassign"
         >
@@ -281,7 +325,7 @@ function AssigneeChip({
         </button>
       ) : (
         <button
-          onClick={() => setOpen((v) => !v)}
+          onClick={toggleOpen}
           className="px-2 py-0.5 rounded text-[11px] bg-yellow-900/40 text-yellow-300 border border-yellow-900/40 hover:bg-yellow-900/60 transition-colors"
           title="Click to assign"
         >
@@ -289,8 +333,21 @@ function AssigneeChip({
         </button>
       )}
 
-      {open && (
-        <div className="absolute right-0 top-full mt-1 z-20 w-56 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl py-1 max-h-72 overflow-y-auto">
+      {open && anchorRect && createPortal(
+        // Rendered in a portal with fixed positioning so the menu escapes the
+        // Focus/zone card's `overflow-hidden` (which used to clip it off the
+        // bottom of the panel). Flips above the chip when it sits low.
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed",
+            left: Math.max(8, anchorRect.right - 224),
+            ...(dropUp
+              ? { bottom: window.innerHeight - anchorRect.top + 4 }
+              : { top: anchorRect.bottom + 4 }),
+          }}
+          className="z-[100] w-56 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl py-1 max-h-72 overflow-y-auto"
+        >
           <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
             {busy ? "Reassigning…" : task.assignedTo ? "Reassign to" : "Assign to"}
           </div>
@@ -312,7 +369,8 @@ function AssigneeChip({
               </button>
             ))
           )}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
@@ -418,7 +476,7 @@ function TaskRow({
       </span>
 
       <div className="flex-1 min-w-0">
-        <div className="font-medium text-sm text-zinc-100 truncate">{task.title}</div>
+        <div className="font-medium text-sm text-zinc-100 truncate">{titleToIST(task.title)}</div>
         <div className="text-xs text-zinc-500 mt-0.5">#{task.entityId}</div>
       </div>
 
@@ -1003,7 +1061,7 @@ function TomorrowView({ tasks, now, agents, canReassign, onRowClick, onReassign 
     (t) => t.appointmentTime && istHourOfDay(new Date(t.appointmentTime)) < 8
   ).length;
   const noPhlebo = tasks.filter(
-    (t) => t.appointmentTime && !metaStr(t, "phleboName")
+    (t) => hasPhleboWorkflow(t) && t.appointmentTime && !metaStr(t, "phleboName")
   ).length;
 
   const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
@@ -1055,7 +1113,7 @@ function TomorrowView({ tasks, now, agents, canReassign, onRowClick, onReassign 
                       onReassign={onReassign}
                       canReassign={canReassign}
                       rightBadge={
-                        !metaStr(t, "phleboName")
+                        hasPhleboWorkflow(t) && !metaStr(t, "phleboName")
                           ? <span className="px-2 py-0.5 rounded text-[10px] shrink-0 bg-amber-900/30 text-amber-300/80">no phlebo yet</span>
                           : undefined
                       }
@@ -1233,7 +1291,7 @@ function StuckView({ tasks, now, agents, canReassign, onRowClick, onReassign, on
                 <div className="text-[10px] text-zinc-600 uppercase tracking-wider">stuck</div>
               </div>
               <div className="flex-1 min-w-0 cursor-pointer" onClick={() => onRowClick(t)} role="button" tabIndex={0}>
-                <div className="font-medium text-sm text-zinc-100 truncate">{t.title}</div>
+                <div className="font-medium text-sm text-zinc-100 truncate">{titleToIST(t.title)}</div>
                 <div className="text-xs text-zinc-500 mt-0.5">
                   #{t.entityId}{storeNameOf(t) ? ` · ${storeNameOf(t)}` : ""}
                 </div>
@@ -1289,9 +1347,16 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
   // can render immediately without a re-fetch. Updated optimistically by
   // the panel's actions; refetched via onUpdate to pick up server state.
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+  // Registered (active) data sources — drives the top-level Source filter so it
+  // lists every source (e.g. Appointments) even when none of its tasks are in
+  // the current view, instead of collapsing when only one source has tasks.
+  const [registeredSources, setRegisteredSources] = useState<{ id: string; displayName: string; sourceId: string }[]>([]);
 
   // ── Filter state (Lead's main tool for slicing the workspace) ───────
   const [filterAssigneeId, setFilterAssigneeId] = useState<"all" | "unassigned" | number>("all");
+  // Top-level Data Source filter ("all" | dataSource.id). The Type/Rule/Store
+  // filters below are second-level — their options scope to the chosen source.
+  const [filterDataSourceId, setFilterDataSourceId] = useState<string>("all");
   const [filterTypes, setFilterTypes] = useState<Set<string>>(new Set()); // empty = all
   // Rule filter — slice the workspace by originating task rule (keyed on
   // taskRuleId). Lets the lead answer "which rule is generating the pile"
@@ -1330,6 +1395,21 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
         );
       })
       .catch((err) => console.error("[MyWork] team fetch failed:", err));
+  }, []);
+
+  // Load registered data sources for the top-level Source filter.
+  useEffect(() => {
+    fetch("/api/data-sources")
+      .then((r) => (r.ok ? r.json() : { dataSources: [] }))
+      .then((d) => {
+        const active = (d.dataSources ?? [])
+          .filter((s: { isActive?: boolean }) => s.isActive !== false)
+          .map((s: { id: string; displayName?: string; sourceId: string }) => ({
+            id: s.id, displayName: s.displayName || s.sourceId, sourceId: s.sourceId,
+          }));
+        setRegisteredSources(active);
+      })
+      .catch((err) => console.error("[MyWork] data-sources fetch failed:", err));
   }, []);
 
   // Reassign handler — used by the AssigneeChip popover on every row.
@@ -1563,7 +1643,9 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
       // Assignee filter
       if (filterAssigneeId === "unassigned" && t.assignedTo) return false;
       if (typeof filterAssigneeId === "number" && t.assignedTo?.id !== filterAssigneeId) return false;
-      // Order-type filter (empty set = all)
+      // Data source filter (top-level; "all" = off)
+      if (filterDataSourceId !== "all" && t.dataSource?.id !== filterDataSourceId) return false;
+      // Entity-type filter (empty set = all)
       if (filterTypes.size > 0 && !filterTypes.has(t.orderType)) return false;
       // Rule filter (empty set = all)
       if (filterRules.size > 0 && !filterRules.has(t.taskRuleId)) return false;
@@ -1575,7 +1657,7 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
       if (filterSla.size > 0 && !filterSla.has(t.slaStatus)) return false;
       return true;
     });
-  }, [tasks, filterAssigneeId, filterTypes, filterRules, filterStore, filterPriorities, filterSla]);
+  }, [tasks, filterAssigneeId, filterDataSourceId, filterTypes, filterRules, filterStore, filterPriorities, filterSla]);
 
   const byBucket = useMemo(() => {
     const t = { today: [] as Task[], tomorrow: [] as Task[], stuck: [] as Task[] };
@@ -1608,13 +1690,57 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
     stuck: byBucket.stuck.length,
   };
 
-  // Set of order types present in the unfiltered workspace — chips render
+  // Data sources present in the workspace — the TOP-LEVEL filter. Every
+  // second-level option (type/rule/store) scopes to the selected source.
+  const availableDataSources = useMemo(() => {
+    // Count tasks per source in the current view.
+    const counts = new Map<string, number>();
+    for (const t of tasks) {
+      const id = t.dataSource?.id;
+      if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+    // Prefer the registered-source list so the Source filter always lists every
+    // active source (Appointments included) even with 0 tasks in view — the
+    // tier no longer collapses when only one source happens to have tasks.
+    if (registeredSources.length > 0) {
+      const byId = new Map(registeredSources.map((s) => [s.id, s]));
+      // Include any source present in tasks but not (yet) in the registered
+      // list, so nothing a task belongs to is ever hidden.
+      for (const t of tasks) {
+        const ds = t.dataSource;
+        if (ds?.id && !byId.has(ds.id)) byId.set(ds.id, { id: ds.id, displayName: ds.displayName || ds.sourceId, sourceId: ds.sourceId });
+      }
+      return Array.from(byId.values())
+        .map((s) => ({ id: s.id, label: s.displayName, count: counts.get(s.id) ?? 0 }))
+        .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+    }
+    // Fallback (registered list not loaded yet): derive from tasks present.
+    const fromTasks = new Map<string, { id: string; label: string; count: number }>();
+    for (const t of tasks) {
+      const ds = t.dataSource;
+      if (!ds?.id) continue;
+      const existing = fromTasks.get(ds.id);
+      if (existing) { existing.count++; continue; }
+      fromTasks.set(ds.id, { id: ds.id, label: ds.displayName || ds.sourceId, count: 1 });
+    }
+    return Array.from(fromTasks.values()).sort((a, b) => b.count - a.count);
+  }, [tasks, registeredSources]);
+
+  // Tasks in scope of the top-level Data Source filter. The second-level
+  // option lists (type/rule/store) are derived from THIS, so switching source
+  // reshapes the row below to that source's own vocabulary.
+  const scopedTasks = useMemo(
+    () => (filterDataSourceId === "all" ? tasks : tasks.filter((t) => t.dataSource?.id === filterDataSourceId)),
+    [tasks, filterDataSourceId],
+  );
+
+  // Set of entity types present in the scoped workspace — chips render
   // dynamically so we only show chips for types that exist.
   const availableTypes = useMemo(() => {
     const s = new Set<string>();
-    for (const t of tasks) s.add(t.orderType);
+    for (const t of scopedTasks) s.add(t.orderType);
     return Array.from(s).sort();
-  }, [tasks]);
+  }, [scopedTasks]);
 
   // Rules present in the unfiltered workspace, with a compact chip label
   // and per-rule task count (count reflects the unfiltered workspace so the
@@ -1623,7 +1749,7 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
   // collection)" compress to "Sample Handover to Lab".
   const availableRules = useMemo(() => {
     const byId = new Map<string, { id: string; label: string; count: number }>();
-    for (const t of tasks) {
+    for (const t of scopedTasks) {
       const id = t.taskRuleId;
       if (!id) continue;
       const existing = byId.get(id);
@@ -1633,12 +1759,14 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
       byId.set(id, { id, label, count: 1 });
     }
     return Array.from(byId.values()).sort((a, b) => b.count - a.count);
-  }, [tasks]);
+  }, [scopedTasks]);
 
-  // Stores present in the workspace, by volume — powers the Store select.
+  // Stores present in the scoped workspace, by volume — powers the Store
+  // select. Empty for sources without a store concept (e.g. Appointments), so
+  // the Store control auto-hides via its length>1 guard for that scope.
   const availableStores = useMemo(() => {
     const byName = new Map<string, number>();
-    for (const t of tasks) {
+    for (const t of scopedTasks) {
       const s = storeNameOf(t);
       if (!s) continue;
       byName.set(s, (byName.get(s) ?? 0) + 1);
@@ -1646,7 +1774,7 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
     return Array.from(byName.entries())
       .sort((a, b) => b[1] - a[1])
       .map(([name, count]) => ({ name, count }));
-  }, [tasks]);
+  }, [scopedTasks]);
 
   const availablePriorities = useMemo(() => {
     const s = new Set<string>();
@@ -1664,12 +1792,23 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
   ];
 
   const anyFilterActive =
-    filterAssigneeId !== "all" || filterTypes.size > 0 || filterRules.size > 0 ||
-    filterStore !== "all" || filterPriorities.size > 0 || filterSla.size > 0;
+    filterAssigneeId !== "all" || filterDataSourceId !== "all" || filterTypes.size > 0 ||
+    filterRules.size > 0 || filterStore !== "all" || filterPriorities.size > 0 || filterSla.size > 0;
 
   const clearAllFilters = () => {
-    setFilterAssigneeId("all"); setFilterTypes(new Set()); setFilterRules(new Set());
-    setFilterStore("all"); setFilterPriorities(new Set()); setFilterSla(new Set());
+    setFilterAssigneeId("all"); setFilterDataSourceId("all"); setFilterTypes(new Set());
+    setFilterRules(new Set()); setFilterStore("all"); setFilterPriorities(new Set()); setFilterSla(new Set());
+  };
+
+  // Switching data source resets the second-level filters — they belong to a
+  // specific source's vocabulary and would otherwise silently exclude the new
+  // source's tasks (e.g. an Order "HSC" type filter left on while viewing
+  // Appointments). Assignee / priority / SLA are cross-source, so they persist.
+  const selectDataSource = (id: string) => {
+    setFilterDataSourceId(id);
+    setFilterTypes(new Set());
+    setFilterRules(new Set());
+    setFilterStore("all");
   };
 
   // Unassigned count for the chip badge (always reflects the unfiltered
@@ -1771,7 +1910,9 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
           Hidden for agents (their queue is small enough that filters add
           noise rather than value). */}
       {!isAgent && (
-      <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3 mb-4 flex items-center gap-3 flex-wrap">
+      <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3 mb-4 flex flex-col gap-2.5">
+        {/* ── Tier 1 — top level: WHO (assignee) and WHICH DATA (source) ── */}
+        <div className="flex items-center gap-3 flex-wrap">
         {/* Assignee selector */}
         <div className="flex items-center gap-2">
           <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Assignee</span>
@@ -1794,7 +1935,58 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
           </select>
         </div>
 
-        {/* Order-type chips */}
+        {/* Data Source chips — top-level slice. The Type/Rule/Store row below
+            reshapes to the selected source's own vocabulary. */}
+        {availableDataSources.length > 1 && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-[10px] text-zinc-500 uppercase tracking-wider mr-1">Source</span>
+            <button
+              onClick={() => selectDataSource("all")}
+              className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
+                filterDataSourceId === "all"
+                  ? "bg-blue-600 border-blue-600 text-white"
+                  : "bg-zinc-900 border-zinc-700 text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              All
+            </button>
+            {availableDataSources.map((ds) => {
+              const active = filterDataSourceId === ds.id;
+              return (
+                <button
+                  key={ds.id}
+                  onClick={() => selectDataSource(active ? "all" : ds.id)}
+                  className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
+                    active
+                      ? "bg-blue-600 border-blue-600 text-white"
+                      : "bg-zinc-900 border-zinc-700 text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {ds.label} <span className={active ? "text-blue-200" : "text-zinc-500"}>{ds.count}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Reset (only shows when something is filtered) */}
+        {anyFilterActive && (
+          <button
+            onClick={clearAllFilters}
+            className="text-xs text-zinc-500 hover:text-zinc-200 ml-auto"
+          >
+            Clear filters
+          </button>
+        )}
+        </div>
+
+        {/* ── Tier 2 — filters scoped to the chosen source (type / rule / store) ── */}
+        {/* Rules render whenever ANY exist (they double as a per-rule count
+            breakdown, valuable even for a single-rule source like Appointments);
+            Type/Store need >1 to be a meaningful choice. */}
+        {(availableTypes.length > 1 || availableRules.length > 0 || availableStores.length > 1) && (
+        <div className="flex items-center gap-3 flex-wrap border-t border-zinc-800/70 pt-2.5">
+        {/* Entity-type chips */}
         {availableTypes.length > 1 && (
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-[10px] text-zinc-500 uppercase tracking-wider mr-1">Type</span>
@@ -1833,7 +2025,7 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
 
         {/* Rule chips — which rule produced the task. Sorted by volume so
             the biggest pile is the first chip; counts are workspace-wide. */}
-        {availableRules.length > 1 && (
+        {availableRules.length > 0 && (
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-[10px] text-zinc-500 uppercase tracking-wider mr-1">Rule</span>
             <button
@@ -1886,7 +2078,11 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
             </select>
           </div>
         )}
+        </div>
+        )}
 
+        {/* ── Tier 3 — cross-source slices (priority / SLA) ── */}
+        <div className="flex items-center gap-3 flex-wrap border-t border-zinc-800/70 pt-2.5">
         {/* Priority chips */}
         {availablePriorities.length > 1 && (
           <div className="flex items-center gap-1.5 flex-wrap">
@@ -1938,16 +2134,7 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
             );
           })}
         </div>
-
-        {/* Reset (only shows when something is filtered) */}
-        {anyFilterActive && (
-          <button
-            onClick={clearAllFilters}
-            className="text-xs text-zinc-500 hover:text-zinc-200 ml-auto"
-          >
-            Clear filters
-          </button>
-        )}
+        </div>
       </div>
       )}
 
@@ -2070,10 +2257,18 @@ export default function MyWorkBoard({ currentUser }: { currentUser: CurrentUser 
         </>
       )}
       {selectedTask && !isAgent && (
-        <OrderQuickView
-          orderId={selectedTask.entityId}
-          onClose={() => setSelectedTask(null)}
-        />
+        (selectedTask.entityType ?? "").toUpperCase() === "APPOINTMENT" ||
+        selectedTask.dataSource?.sourceId === "Appointments" ? (
+          <AppointmentQuickView
+            appointmentId={selectedTask.entityId}
+            onClose={() => setSelectedTask(null)}
+          />
+        ) : (
+          <OrderQuickView
+            orderId={selectedTask.entityId}
+            onClose={() => setSelectedTask(null)}
+          />
+        )
       )}
     </div>
   );

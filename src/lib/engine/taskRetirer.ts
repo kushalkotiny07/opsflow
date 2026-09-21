@@ -34,6 +34,9 @@ import prisma from "@/lib/db/client";
 // from API request slots.
 import { labstackWorker as labstack } from "@/lib/db/labstack";
 import { TaskStatus } from "@prisma/client";
+import { isValidTableReference } from "@/lib/validation/data-sources";
+
+const SQL_IDENT_RE = /^[a-zA-Z0-9_]+$/;
 
 const TERMINAL_TASK_STATUSES: TaskStatus[] = [
   TaskStatus.COMPLETED,
@@ -76,7 +79,11 @@ export async function runTaskRetirer(): Promise<RetirementResult> {
       isArchived: false,
       status: { notIn: TERMINAL_TASK_STATUSES },
       taskRuleId: { not: "MANUAL" },
-      entityType: "ORDER",
+      // Every source is retire-eligible now (Order, Appointment, PharmaOrder…).
+      // Each task's current status is re-checked against its OWN source table
+      // below, keyed by the rule's data source. Previously hardcoded to
+      // entityType:"ORDER", which left non-Order tasks to linger until the
+      // nightly archive.
       createdAt: { lt: ageCutoff },
     },
     select: {
@@ -88,6 +95,10 @@ export async function runTaskRetirer(): Promise<RetirementResult> {
           id: true,
           name: true,
           triggerCondition: true,
+          dataSourceId: true,
+          dataSource: {
+            select: { tableReference: true, statusFieldName: true, primaryKeyField: true },
+          },
         },
       },
     },
@@ -125,33 +136,66 @@ export async function runTaskRetirer(): Promise<RetirementResult> {
     return { totalRetired: 0, perRule: [] };
   }
 
-  // Bulk-fetch current order status from labstack. One query, regardless
-  // of task count, scoped to the IN-list of order ids we actually care
-  // about. Casts orderStatus to text so we don't have to bind the custom
-  // OrderStatus enum from a JS string.
-  const orderIds = Array.from(
-    new Set(candidateTasks.map((t) => t.entityId).filter((id): id is number => id != null))
-  );
-  if (orderIds.length === 0) {
-    return { totalRetired: 0, perRule: [] };
+  // Bulk-fetch each entity's CURRENT status from its own source table. Tasks
+  // are grouped by data source (Order, Appointment, …) so we run one query per
+  // source, each casting the source's status column to text (avoids binding
+  // the custom PG enum). Status is keyed by "<sourceKey>:<id>" so an Order #42
+  // and an Appointment #42 never collide.
+  interface SourceGroup {
+    tableReference: string;
+    statusField: string;
+    pk: string;
+    ids: Set<number>;
+  }
+  const groups = new Map<string, SourceGroup>();
+  const taskSourceKey = new Map<number, string>(); // task.id → source group key
+  for (const t of candidateTasks) {
+    if (t.entityId == null) continue;
+    const ds = t.taskRule.dataSource;
+    // Legacy/Order fallback: a rule with no resolvable source is treated as the
+    // Order table (matches the pre-source-aware behaviour).
+    const tableReference = ds?.tableReference ?? `public."Order"`;
+    const statusField = ds?.statusFieldName ?? "orderStatus";
+    const pk = ds?.primaryKeyField ?? "id";
+    // Defence in depth: skip a source with a malformed identifier rather than
+    // build an unsafe query (registration validates these, but a direct DB
+    // write could slip one through).
+    if (!isValidTableReference(tableReference) || !SQL_IDENT_RE.test(statusField) || !SQL_IDENT_RE.test(pk)) {
+      continue;
+    }
+    const key = `${tableReference}|${statusField}|${pk}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { tableReference, statusField, pk, ids: new Set() };
+      groups.set(key, g);
+    }
+    g.ids.add(t.entityId);
+    taskSourceKey.set(t.id, key);
   }
 
-  type OrderStatusRow = { id: number; status: string };
-  const statusRows = await labstack.$queryRawUnsafe<OrderStatusRow[]>(
-    `SELECT id, "orderStatus"::text AS status FROM public."Order" WHERE id = ANY($1::int[])`,
-    orderIds
-  );
-  const currentStatusById = new Map<number, string>();
-  statusRows.forEach((r) => currentStatusById.set(r.id, r.status));
+  // "<sourceKey>:<id>" → current status text.
+  const currentStatusByKey = new Map<string, string>();
+  for (const [key, g] of groups) {
+    const ids = Array.from(g.ids);
+    if (ids.length === 0) continue;
+    type StatusRow = { id: number; status: string };
+    const rows = await labstack.$queryRawUnsafe<StatusRow[]>(
+      `SELECT "${g.pk}" AS id, "${g.statusField}"::text AS status FROM ${g.tableReference} WHERE "${g.pk}" = ANY($1::int[])`,
+      ids,
+    );
+    rows.forEach((r) => currentStatusByKey.set(`${key}:${r.id}`, r.status));
+  }
 
-  // Decide which tasks to retire: rule has statusIn AND current order
-  // status is NOT in it. Tasks whose order has been deleted from labstack
-  // also retire (defensive — keeps the queue clean).
+  // Decide which tasks to retire: rule has statusIn AND current source status
+  // is NOT in it. Entities deleted from the source also retire (defensive —
+  // keeps the queue clean).
   const toRetire: { id: number; ruleId: string; ruleName: string; oldStatus: string }[] = [];
   for (const t of candidateTasks) {
     const statusIn = ruleStatusInById.get(t.taskRule.id);
     if (!statusIn || statusIn.size === 0) continue;
-    const current = currentStatusById.get(t.entityId) ?? "<order-not-found>";
+    const key = taskSourceKey.get(t.id);
+    if (!key) continue;
+    const current = currentStatusByKey.get(`${key}:${t.entityId}`) ?? "<entity-not-found>";
     if (!statusIn.has(current)) {
       toRetire.push({
         id: t.id,
@@ -206,7 +250,7 @@ export async function runTaskRetirer(): Promise<RetirementResult> {
         // re-collection). The close is correct either way; if the order
         // re-enters the rule's statusIn later, the creator re-fires the rule
         // (engine-retired tasks no longer occupy the dedup slot).
-        note: `Auto-closed by engine — source order moved to ${t.oldStatus} (out of rule's statusIn)`,
+        note: `Auto-closed by engine — source entity moved to ${t.oldStatus} (out of rule's statusIn)`,
       })),
     });
   });

@@ -21,6 +21,7 @@ import {
   validationError,
 } from "@/lib/validation/data-sources";
 import { newRequestId, logAndBuildErrorBody } from "@/lib/observability/request-id";
+import { introspectColumnValues, tableNameFromReference } from "@/lib/data-sources/column-enums";
 
 const VALID_POLLING_TYPES: DataSourceType[] = ["DATABASE", "WEBHOOK", "API"];
 
@@ -194,6 +195,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ─── Capture the type/status column enums at registration ─────────────
+    // Introspect the live LABSTACK columns so rule validation has the source's
+    // real value set from day one. Best-effort: a null result (replica down,
+    // text column) leaves the column empty and the rule validator falls back to
+    // live introspection at save time. Never blocks registration.
+    const table = tableNameFromReference(body.tableReference);
+    const [typeFieldEnumValues, statusFieldEnumValues] = await Promise.all([
+      introspectColumnValues(table, body.typeFieldName),
+      introspectColumnValues(table, body.statusFieldName),
+    ]);
+
     // ─── Create ───────────────────────────────────────────────────────────
     const dataSource = await prisma.dataSource.create({
       data: {
@@ -204,6 +216,8 @@ export async function POST(req: NextRequest) {
         primaryKeyField: body.primaryKeyField || "id",
         typeFieldName: body.typeFieldName,
         statusFieldName: body.statusFieldName,
+        typeFieldEnumValues: typeFieldEnumValues.length > 0 ? typeFieldEnumValues : undefined,
+        statusFieldEnumValues: statusFieldEnumValues.length > 0 ? statusFieldEnumValues : undefined,
         queryTemplate: body.queryTemplate,
         metadataFieldMapping: body.metadataFieldMapping,
         analyticsConfig: body.analyticsConfig ?? undefined,

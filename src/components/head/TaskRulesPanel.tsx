@@ -126,6 +126,53 @@ interface SourceKey {
   observedIn: number;
 }
 
+// Title-template variables the engine always resolves (taskCreator passes these
+// named fields for every source). storeName/labName/phleboName are meaningful
+// only for the Order source, so they're offered only there.
+const UNIVERSAL_TITLE_VARS = ["patientName", "orderId", "appointmentTime"];
+const ORDER_ONLY_TITLE_VARS = ["storeName", "labName", "phleboName"];
+
+/** public."Order" | public.Order | "Order" → Order */
+function bareTableOf(tableReference?: string | null): string | null {
+  if (!tableReference) return null;
+  return tableReference.replace(/^.*\./, "").replace(/^"(.+)"$/, "$1");
+}
+
+/**
+ * The template variables to offer for the selected source. Universal fields
+ * plus (for the Order table) the order-only fields, then the source's own
+ * columns observed via metadata-keys — so the hint matches the data source
+ * instead of always showing Lab-Order fields. taskCreator spreads the entity's
+ * fields into the title context, so these source columns actually resolve.
+ */
+function titleVarsForSource(
+  selectedSource: { tableReference: string } | null,
+  sourceKeys: SourceKey[],
+): string[] {
+  const table = bareTableOf(selectedSource?.tableReference);
+  // Order table: show the curated Order vars (its raw columns aren't carried
+  // into the title context, so only the named fields resolve).
+  if (table === "Order") return [...UNIVERSAL_TITLE_VARS, ...ORDER_ONLY_TITLE_VARS];
+  // Unknown source (still loading, or none picked): the safe cross-source set
+  // only — never assume Lab Orders and show store/lab/phlebo for, say, an
+  // Appointments rule mid-load.
+  if (!table) return [...UNIVERSAL_TITLE_VARS];
+
+  // Non-Order sources: universal fields + the source's own top-level columns.
+  // taskCreator spreads the entity's raw row into the title context, so these
+  // resolve. Simple identifiers only ({{key}} can't address dot-paths); skip
+  // ones already listed and noisy foreign-key columns that never title well.
+  const vars = [...UNIVERSAL_TITLE_VARS];
+  const simpleIdent = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+  for (const k of sourceKeys) {
+    if (!simpleIdent.test(k.path)) continue;
+    if (vars.includes(k.path)) continue;
+    if (/(^|_)id$/i.test(k.path)) continue; // id / user_id / slot_id …
+    vars.push(k.path);
+  }
+  return vars;
+}
+
 function TriggerBuilder({
   value = { ...EMPTY_TRIGGER },
   onChange,
@@ -548,6 +595,7 @@ function RuleDrawer({ rule, allTags, chains, metadataFields, orderStatuses, onCl
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState(false);
+  const [purging, setPurging] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [activeTab, setActiveTab] = useState<"source" | "trigger" | "basics" | "assignment" | "checklist">("source");
 
@@ -696,6 +744,39 @@ function RuleDrawer({ rule, allTags, chains, metadataFields, orderStatuses, onCl
     }
   }
 
+  // Remove tasks this rule created by mistake — archives them (recoverable) and
+  // cancels the open ones, so they leave every board and free the dedup slot
+  // for a corrected rule to re-create the right tasks.
+  async function purgeTasks() {
+    if (!rule) return;
+    setPurging(true);
+    setError("");
+    try {
+      const countRes = await fetch(`/api/task-rules/${rule.id}/purge-tasks`);
+      const counts = await countRes.json().catch(() => ({ open: 0, total: 0 }));
+      const open: number = counts.open ?? 0;
+      const total: number = counts.total ?? 0;
+      if (total === 0) { window.alert("This rule has no tasks to remove."); return; }
+      const ok = window.confirm(
+        `Remove all ${total} task${total === 1 ? "" : "s"} created by "${rule.name}"?\n\n` +
+        `${open} open ${open === 1 ? "task" : "tasks"} will be cancelled, and all ${total} archived ` +
+        `(recoverable from the Archived Tasks board). The corrected rule can re-create tasks on the next cycle.`,
+      );
+      if (!ok) return;
+      const res = await fetch(`/api/task-rules/${rule.id}/purge-tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "all" }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setError(data.error ?? "Failed to remove tasks"); return; }
+      onSaved();
+      window.alert(`Removed ${data.removed ?? 0} task${data.removed === 1 ? "" : "s"}.`);
+    } finally {
+      setPurging(false);
+    }
+  }
+
   const TABS = [
     { key: "source",      label: "Data Source" },
     { key: "trigger",     label: "Trigger" },
@@ -818,17 +899,20 @@ function RuleDrawer({ rule, allTags, chains, metadataFields, orderStatuses, onCl
                     className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-blue-500"
                   />
                   <p className="text-[10px] text-zinc-600 mt-1">
-                    Available variables:{" "}
-                    {["{{patientName}}", "{{orderId}}", "{{storeName}}", "{{labName}}", "{{phleboName}}"].map((v) => (
-                      <code
-                        key={v}
-                        onClick={() => setForm({ ...form, titleTemplate: form.titleTemplate + v })}
-                        className="cursor-pointer text-zinc-400 hover:text-blue-400 mr-1 transition-colors"
-                        title="Click to insert"
-                      >
-                        {v}
-                      </code>
-                    ))}
+                    Available variables{selectedSource ? ` (${selectedSource.displayName})` : ""}:{" "}
+                    {titleVarsForSource(selectedSource, sourceKeys).map((name) => {
+                      const v = `{{${name}}}`;
+                      return (
+                        <code
+                          key={name}
+                          onClick={() => setForm({ ...form, titleTemplate: form.titleTemplate + v })}
+                          className="cursor-pointer text-zinc-400 hover:text-blue-400 mr-1 transition-colors"
+                          title="Click to insert"
+                        >
+                          {v}
+                        </code>
+                      );
+                    })}
                   </p>
                 </div>
 
@@ -979,12 +1063,11 @@ function RuleDrawer({ rule, allTags, chains, metadataFields, orderStatuses, onCl
                       checklist editor will appear here.
                     </p>
                   </div>
-                ) : rule?.taskType?.id ? (
-                  /* Reuse the same editor used in /head/rules (page-based
-                     RuleForm). It targets ChecklistTemplate rows keyed by
-                     taskTypeId — multiple rules sharing a type share the
-                     same checklist, which the editor surfaces as a pill. */
-                  <ChecklistEditor taskTypeId={rule.taskType.id} />
+                ) : rule?.id && rule?.taskType?.id ? (
+                  /* Checklist is scoped to THIS rule (rows keyed by taskRuleId),
+                     seeded from the task-type default on first edit — so editing
+                     one rule never mutates another that shares the task type. */
+                  <ChecklistEditor ruleId={rule.id} />
                 ) : (
                   <div className="px-3 py-3 bg-zinc-800/40 border border-zinc-700 rounded-lg">
                     <p className="text-[11px] text-zinc-400 leading-relaxed">
@@ -1100,18 +1183,33 @@ function RuleDrawer({ rule, allTags, chains, metadataFields, orderStatuses, onCl
 
         <div className="px-6 py-4 border-t border-zinc-800 flex items-center gap-2">
           {!isCreate && (
-            <div className="mr-auto">
+            <div className="mr-auto flex items-center gap-2">
               {!confirmDelete ? (
-                <button
-                  type="button"
-                  onClick={() => setConfirmDelete(true)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-zinc-600 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
-                >
-                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                  </svg>
-                  Delete Rule
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDelete(true)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-zinc-600 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                    Delete Rule
+                  </button>
+                  <button
+                    type="button"
+                    onClick={purgeTasks}
+                    disabled={purging}
+                    title="Archive every task this rule created (open ones are cancelled). Recoverable from Archived Tasks."
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-zinc-600 hover:text-amber-400 hover:bg-amber-500/10 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M20 7L9.5 17.5 4 12" opacity="0" />
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 8h14M9 8V6a2 2 0 012-2h2a2 2 0 012 2v2m-7 4l6 6m0-6l-6 6" />
+                    </svg>
+                    {purging ? "Removing…" : "Clear tasks"}
+                  </button>
+                </>
               ) : (
                 <div className="flex items-center gap-2">
                   <button onClick={deleteRule} disabled={deleting} className="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs font-medium rounded-lg disabled:opacity-50 transition-colors">
@@ -1291,8 +1389,29 @@ export default function TaskRulesPanel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ isActive: !rule.isActive }),
       });
-      if (res.ok) {
-        setRules((prev) => prev.map((r) => r.id === rule.id ? { ...r, isActive: !r.isActive } : r));
+      if (!res.ok) return;
+      setRules((prev) => prev.map((r) => r.id === rule.id ? { ...r, isActive: !r.isActive } : r));
+
+      // Disabling stops NEW task creation but leaves already-open tasks in the
+      // queue. If the rule still owns open tasks, offer to close them so they
+      // leave Smart View immediately (see POST /close-open-tasks).
+      const data = await res.json().catch(() => ({}));
+      const openTaskCount: number = data?.openTaskCount ?? 0;
+      if (!rule.isActive) return; // we just ENABLED it — nothing to close
+      if (openTaskCount > 0 &&
+          window.confirm(
+            `Rule disabled. It still has ${openTaskCount} open task${openTaskCount === 1 ? "" : "s"}.\n\n` +
+            `Close ${openTaskCount === 1 ? "it" : "them"} now? They'll be cancelled and leave Smart View. ` +
+            `(Re-enabling the rule will re-create them if the source still matches.)`,
+          )) {
+        const closeRes = await fetch(`/api/task-rules/${rule.id}/close-open-tasks`, { method: "POST" });
+        const closeData = await closeRes.json().catch(() => ({}));
+        if (closeRes.ok) {
+          fetchAll(); // refresh 24h/total counts on the row
+          window.alert(`Closed ${closeData?.closed ?? 0} open task${closeData?.closed === 1 ? "" : "s"}.`);
+        } else {
+          window.alert("Couldn't close the open tasks — please try again.");
+        }
       }
     } finally {
       setSaving(null);

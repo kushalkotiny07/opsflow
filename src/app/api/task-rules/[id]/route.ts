@@ -6,7 +6,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { ZodError } from "zod";
 import { getSessionFromRequest } from "@/lib/auth/session";
 import prisma from "@/lib/db/client";
-import { UserRole } from "@prisma/client";
+import { UserRole, TaskStatus } from "@prisma/client";
 import { logRuleAudit } from "@/lib/engine/ruleAudit";
 import {
   updateRuleSchema,
@@ -148,7 +148,22 @@ export async function PATCH(
       });
     }
 
-    return NextResponse.json({ rule: updated, requestId });
+    // When this PATCH just disabled the rule, tell the client how many open
+    // tasks it still owns so the UI can offer to close them (disabling stops
+    // NEW creation but leaves already-open tasks in the queue). Close is a
+    // separate, explicit action — see POST /close-open-tasks.
+    let openTaskCount = 0;
+    if (parsed.isActive === false && rule.isActive === true) {
+      openTaskCount = await prisma.task.count({
+        where: {
+          taskRuleId: id,
+          isArchived: false,
+          status: { notIn: [TaskStatus.COMPLETED, TaskStatus.CANCELLED] },
+        },
+      });
+    }
+
+    return NextResponse.json({ rule: updated, openTaskCount, requestId });
   } catch (error) {
     return NextResponse.json(
       logAndBuildErrorBody({

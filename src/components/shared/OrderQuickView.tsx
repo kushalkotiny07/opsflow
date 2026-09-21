@@ -4,7 +4,9 @@ import { useState, useEffect, useRef } from "react";
 import StatusBadge from "@/components/shared/StatusBadge";
 import PriorityBadge from "@/components/shared/PriorityBadge";
 import SlaCountdown from "@/components/shared/SlaCountdown";
-import { formatISTTimestamp, formatISTDate } from "@/lib/utils/timezone";
+import TaskChecklistView, { type ChecklistViewItem } from "@/components/shared/TaskChecklistView";
+import CallButton from "@/components/shared/CallButton";
+import { formatISTTimestamp, formatISTDate, titleToIST } from "@/lib/utils/timezone";
 
 interface OrderDetail {
   id: number;
@@ -37,6 +39,8 @@ interface OrderTask {
   createdAt: string;
   assignedTo: { id: number; name: string } | null;
   taskType: { label: string } | null;
+  metadata?: Record<string, unknown> | null;
+  checklistItems?: ChecklistViewItem[];
 }
 
 /** A milestone SLA breach on this order, from lib/provider-comms. */
@@ -116,8 +120,11 @@ export default function OrderQuickView({ orderId, onClose }: OrderQuickViewProps
       try {
         const res = await fetch(`/api/orders/${orderId}`);
         if (!res.ok) {
-          const d = await res.json();
-          throw new Error(d.error ?? "Order not found");
+          // Error responses aren't always JSON (a 500 can be an HTML page) —
+          // parse defensively so we show a clean message, not a JSON-parse error.
+          let msg = `Failed to load order (HTTP ${res.status})`;
+          try { const d = await res.json(); if (d?.error) msg = d.error; } catch { /* non-JSON body */ }
+          throw new Error(msg);
         }
         const data = await res.json();
         setOrder(data.order);
@@ -207,7 +214,12 @@ export default function OrderQuickView({ orderId, onClose }: OrderQuickViewProps
                   <InfoRow label="Store" value={order.storeName ?? (order.storeId ? `#${order.storeId}` : null)} />
                   <InfoRow label="Lab" value={order.labName ?? (order.labId ? `#${order.labId}` : null)} />
                   <InfoRow label="Phlebo" value={
-                    order.phleboName ? `${order.phleboName}${order.phleboNumber ? ` (${order.phleboNumber})` : ""}` : null
+                    order.phleboName ? (
+                      <span>
+                        {order.phleboName}{order.phleboNumber ? ` (${order.phleboNumber})` : ""}
+                        {order.phleboNumber && <> <CallButton to={order.phleboNumber} name={order.phleboName} triggeredFrom="order-phlebo" /></>}
+                      </span>
+                    ) : null
                   } />
                   <InfoRow label="Created" value={formatISTDate(order.createdAt)} />
                   <InfoRow label="Last Updated" value={formatISTTimestamp(order.updatedAt, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })} />
@@ -308,7 +320,7 @@ export default function OrderQuickView({ orderId, onClose }: OrderQuickViewProps
                       <div key={task.id} className="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-3">
                         <div className="flex items-start justify-between gap-2 mb-2">
                           <div className="flex-1 min-w-0">
-                            <div className="text-xs font-medium text-zinc-200 leading-snug">{task.title}</div>
+                            <div className="text-xs font-medium text-zinc-200 leading-snug">{titleToIST(task.title)}</div>
                             <div className="text-[10px] text-zinc-600 mt-0.5">
                               #{task.id} · {task.taskType?.label ?? "Task"}
                             </div>
@@ -329,6 +341,7 @@ export default function OrderQuickView({ orderId, onClose }: OrderQuickViewProps
                             </span>
                           )}
                         </div>
+                        <TaskChecklistView items={task.checklistItems ?? []} metadata={task.metadata} />
                       </div>
                     ))}
                   </div>

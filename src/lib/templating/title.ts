@@ -20,6 +20,8 @@
  *      later occurrences unrendered. We use a `RegExp(..., "g")` here.
  */
 
+import { formatISTShort, titleToIST } from "@/lib/utils/timezone";
+
 export interface TitleContext {
   patientName?: string | null;
   orderId?: number | string | null;
@@ -51,8 +53,11 @@ export function renderTitleTemplate(
       if (key === "storeName" || key === "labName" || key === "phleboName") return "";
       return `[missing: ${key}]`;
     }
-    if (value instanceof Date) return value.toISOString();
-    return String(value);
+    // Dates render as compact IST (DD-MM-YYYY HH:MM) — task titles are read by
+    // humans in IST, not as raw UTC ISO. Also catch ISO-string values (e.g. a
+    // metadata field carried through as a string) via titleToIST below.
+    if (value instanceof Date) return formatISTShort(value);
+    return titleToIST(String(value));
   });
 }
 

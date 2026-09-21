@@ -74,3 +74,34 @@ export function formatISTTime(
   if (isNaN(date.getTime())) return "—";
   return date.toLocaleTimeString("en-IN", { ...options, timeZone: "Asia/Kolkata" });
 }
+
+/**
+ * Compact IST stamp: "DD-MM-YYYY HH:MM" (24h, Asia/Kolkata). Used inside task
+ * titles so appointment date/times read as local wall-clock instead of a raw
+ * UTC ISO string. Returns "" for an unparseable input.
+ */
+export function formatISTShort(input: string | number | Date): string {
+  const date = input instanceof Date ? input : new Date(input);
+  if (isNaN(date.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(date);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("day")}-${get("month")}-${get("year")} ${get("hour")}:${get("minute")}`;
+}
+
+// Any ISO-8601 UTC timestamp embedded in text (e.g. baked into a task title).
+const ISO_UTC_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z/g;
+
+/**
+ * Rewrite any embedded ISO-8601 UTC timestamps in a string to compact IST
+ * (DD-MM-YYYY HH:MM). Idempotent for already-formatted titles (no ISO to
+ * match). Used at display time so tasks whose title baked a UTC ISO stamp read
+ * in local time without a data backfill.
+ */
+export function titleToIST(text: string | null | undefined): string {
+  if (!text) return text ?? "";
+  return text.replace(ISO_UTC_RE, (m) => formatISTShort(m) || m);
+}

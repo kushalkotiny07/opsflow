@@ -107,6 +107,13 @@ services:
       # blank to disable image interpretation (it no-ops cleanly).
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       WA_VISION_MODEL: ${WA_VISION_MODEL:-}
+      # Click-to-call (Exotel). Blank ⇒ the "Call" button reports "not
+      # configured". Set real values in .env — never commit them.
+      EXOTEL_SESSION_ID: ${EXOTEL_SESSION_ID:-}
+      EXOTEL_USERNAME: ${EXOTEL_USERNAME:-}
+      EXOTEL_PASSWORD: ${EXOTEL_PASSWORD:-}
+      EXOTEL_CALLER_ID: ${EXOTEL_CALLER_ID:-}
+      NEXT_PUBLIC_EXOTEL_API_BASE_URL: ${NEXT_PUBLIC_EXOTEL_API_BASE_URL:-https://twilix.exotel.in}
     ports:
       - "${APP_PORT:-3000}:3000"
     # Required for host.docker.internal to resolve on Linux (no-op on

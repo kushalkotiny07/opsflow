@@ -115,8 +115,54 @@ model User {
   dataSourcesCreated      DataSource[]          @relation("DataSourceCreatedBy")
   ruleSourceScopesCreated TaskRuleSourceScope[] @relation("RuleSourceScopeCreatedBy")
   alerts                  Alert[]
+  calls                   CallLog[]
 
   @@map("users")
+}
+
+// ─────────────────────────────────────────────
+// CLICK-TO-CALL (Exotel)
+// ─────────────────────────────────────────────
+
+enum CallSource {
+  EXOTEL
+}
+
+enum CallStatus {
+  INITIATED
+  RINGING
+  ANSWERED
+  COMPLETED
+  FAILED
+  BUSY
+  NO_ANSWER
+  CANCELED
+}
+
+model CallLog {
+  id             Int        @id @default(autoincrement())
+  source         CallSource @default(EXOTEL)
+  status         CallStatus @default(INITIATED)
+  sourceMobile   String // the agent's phone Exotel dials first
+  targetMobile   String // the patient/doctor/phlebo being called
+  targetUserName String?
+  userId         Int? // the OpsFlow user who placed the call
+  storeId        Int?
+  taskId         Int?
+  triggeredFrom  String? // where in the UI the call was started
+  sid            String? // Exotel CallSid
+  recordingUrl   String?
+  durationSec    Int?
+  errorMessage   String?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([taskId])
+  @@index([sid])
+  @@map("call_logs")
 }
 
 model Session {
@@ -317,6 +363,10 @@ model TaskType {
   normalAgingMinutes   Int      @default(30)
   warningAgingMinutes  Int      @default(45)
   criticalAgingMinutes Int      @default(60)
+  // Task-level "next step" guidance, shown in the drawer once the agent knows
+  // whether the checklist is complete. Copied onto each task at creation.
+  nextStepComplete     String?
+  nextStepIncomplete   String?
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
@@ -330,13 +380,23 @@ model TaskType {
 model ChecklistTemplate {
   id         Int      @id @default(autoincrement())
   taskTypeId Int
+  // When set, this row is scoped to ONE rule (overrides the task-type default,
+  // which are the rows with taskRuleId = null). Lets two rules that share a
+  // task type keep separate checklists.
+  taskRuleId String?
   stepOrder  Int
   stepText   String
   isRequired Boolean  @default(true)
+  // Per-step agent guidance, copied onto each task's checklist item at
+  // creation: `guidance` = what to do for this step; `script` = words to say.
+  guidance   String?
+  script     String?
   createdAt  DateTime @default(now())
 
-  taskType TaskType @relation(fields: [taskTypeId], references: [id], onDelete: Cascade)
+  taskType TaskType  @relation(fields: [taskTypeId], references: [id], onDelete: Cascade)
+  taskRule TaskRule? @relation(fields: [taskRuleId], references: [id], onDelete: Cascade)
 
+  @@index([taskRuleId])
   @@map("checklist_templates")
 }
 
@@ -365,6 +425,10 @@ model TaskRule {
   // Allowed values: default | round_robin | store_affinity | skill_based | least_loaded
   assignmentStrategy     String              @default("default")
   escalationChainId      Int?
+  // Rule-scoped "next step" guidance. Overrides the task type's defaults so
+  // two rules that share a task type don't share this guidance.
+  nextStepComplete       String?
+  nextStepIncomplete     String?
   createdAt              DateTime            @default(now())
   updatedAt              DateTime            @updatedAt
 
@@ -374,6 +438,10 @@ model TaskRule {
   requiredSkills  TaskRuleSkill[]
   tasks           Task[]
   sourceScopes    TaskRuleSourceScope[]
+  // Rule-scoped checklist steps. When present, they override the task type's
+  // shared default (ChecklistTemplate rows with taskRuleId = null), so editing
+  // one rule's checklist never mutates another rule's.
+  checklist       ChecklistTemplate[]
 
   @@map("task_rules")
 }
@@ -514,6 +582,9 @@ model TaskChecklistItem {
   stepOrder  Int
   stepText   String
   isRequired Boolean   @default(true)
+  // Snapshotted from the template at creation (see ChecklistTemplate).
+  guidance   String?
+  script     String?
   isDone     Boolean   @default(false)
   doneAt     DateTime?
   createdAt  DateTime  @default(now())

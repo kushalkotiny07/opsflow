@@ -58,6 +58,8 @@ import { evaluateTrigger, type TriggerCheck } from "@/lib/engine/taskCreator";
 import { fetchAllActiveOrders } from "@/lib/engine/labstack";
 import { labstackOr } from "@/lib/db/labstack";
 import type { RawOrder } from "@/lib/engine/labstack";
+import { fetchSourceSample } from "@/lib/engine/sourceSample";
+import { bareTableName } from "@/lib/validation/data-sources";
 import { renderTitleTemplate } from "@/lib/templating/title";
 import { triggerConditionSchema, zodErrorToResponse } from "@/lib/validation/task-rules";
 import { newRequestId, logAndBuildErrorBody } from "@/lib/observability/request-id";
@@ -142,23 +144,51 @@ export async function POST(request: NextRequest) {
       titleTemplate = inline.titleTemplate;
     }
 
-    // ─── Fetch sample orders ──────────────────────────────────────────────
-    // Simulate dry-runs against recent labstack orders. Two perf protections:
+    // ─── Resolve the source so we sample the RIGHT table ──────────────────
+    // Previously this always sampled the Order table, so an Appointments /
+    // PharmaOrder rule was dry-run against ORDER rows and every row "skipped"
+    // on the wrong entity. Sample from the rule's own source instead.
+    const source = await prisma.dataSource.findUnique({
+      where: { id: dataSourceId },
+      select: {
+        tableReference: true, primaryKeyField: true,
+        typeFieldName: true, statusFieldName: true, metadataFieldMapping: true,
+      },
+    });
+    if (!source) {
+      return NextResponse.json({ error: "Data source not found", requestId }, { status: 404 });
+    }
+    const isOrderSource = bareTableName(source.tableReference) === "Order";
+
+    // ─── Fetch sample entities ────────────────────────────────────────────
+    // Two perf protections carry over to both paths:
     //
-    // 1. since cursor: fetch only orders touched in the last 7 days. The
-    //    unbounded fetchAllActiveOrders() scans the full Order table —
-    //    cheap on a healthy labstack, devastating when labstack is stuck
-    //    on a lock. Simulate is a UI dry-run; a 7-day sample is plenty
-    //    representative and avoids hitting the entire history.
+    // 1. since cursor: only entities touched in the last 7 days. Unbounded
+    //    scans are cheap on a healthy labstack, devastating on a lock storm.
+    //    Simulate is a UI dry-run; a 7-day sample is plenty representative.
     //
-    // 2. labstackOr ceiling (10s, worker pool): if the bounded query
-    //    still hangs (labstack outage / network), return a clean JSON 503
-    //    instead of letting nginx 504 with an HTML body the client can't
-    //    parse. The simulator dialog now shows "try again in a moment"
-    //    instead of a parse-error stack.
+    // 2. labstackOr ceiling (10s, worker pool): if the query hangs (labstack
+    //    outage / network), return a clean JSON 503 instead of letting nginx
+    //    504 with an HTML body the client can't parse.
     const since = new Date(Date.now() - 7 * 24 * 60 * 60_000);
+    // Non-Order sources: cap the recent window generously, then slice to limit,
+    // so "available" reflects recent volume like the Order path does.
+    const SOURCE_SAMPLE_CAP = Math.max(parsed.limit, 500);
     const allOrders = await labstackOr<RawOrder[] | null>(
-      fetchAllActiveOrders(since),
+      isOrderSource
+        ? fetchAllActiveOrders(since)
+        : fetchSourceSample(
+            {
+              tableReference: source.tableReference,
+              primaryKeyField: source.primaryKeyField,
+              typeFieldName: source.typeFieldName,
+              statusFieldName: source.statusFieldName,
+              metadataFieldMapping:
+                (source.metadataFieldMapping as Record<string, string> | null) ?? null,
+            },
+            since,
+            SOURCE_SAMPLE_CAP,
+          ),
       null,
       10_000,
       { breakerKey: "worker" },

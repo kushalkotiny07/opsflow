@@ -7,7 +7,8 @@ import PriorityBadge from "@/components/shared/PriorityBadge";
 import StatusBadge from "@/components/shared/StatusBadge";
 import OrderQuickView from "@/components/shared/OrderQuickView";
 import AssignmentAuditTrail from "@/components/shared/AssignmentAuditTrail";
-import { formatISTTimestamp } from "@/lib/utils/timezone";
+import { formatISTTimestamp, titleToIST } from "@/lib/utils/timezone";
+import CallButton from "@/components/shared/CallButton";
 
 interface ChecklistItem {
   id: number;
@@ -16,6 +17,8 @@ interface ChecklistItem {
   isRequired: boolean;
   isDone: boolean;
   doneAt: string | null;
+  guidance?: string | null;
+  script?: string | null;
 }
 
 interface Task {
@@ -24,6 +27,10 @@ interface Task {
   status: string;
   priority: string;
   orderType: string;
+  // Source entity kind — "ORDER" (default), "APPOINTMENT", … Drives whether the
+  // drawer shows order context or appointment (doctor/meeting) context.
+  entityType?: string;
+  dataSource?: { id: string; sourceId: string; displayName: string } | null;
   entityId: number;
   storeId: number | null;
   slaDeadline: string;
@@ -37,6 +44,24 @@ interface Task {
   assignedTo: { id: number; name: string } | null;
   checklistItems: ChecklistItem[];
   taskType: { name: string; label: string };
+}
+
+interface AppointmentContext {
+  id: number;
+  appointmentType: string | null;
+  appointmentStatus: string | null;
+  appointmentDate: string | null;
+  duration: number | null;
+  referenceId: string | null;
+  appointmentUrl: string | null;
+  notes: string | null;
+  internalNotes: string | null;
+  orderId: number | null;
+  patientName: string | null;
+  patientMobile: string | null;
+  doctorName: string | null;
+  doctorMobile: string | null;
+  storeName: string | null;
 }
 
 interface TaskDetailPanelProps {
@@ -156,15 +181,28 @@ export default function TaskDetailPanel({ task, onUpdate }: TaskDetailPanelProps
     phleboNumber: string | null;
   } | null>(null);
 
-  // Hydrate full task detail (checklistItems, history, etc.) and the
-  // associated order context in parallel. Both endpoints already exist.
+  // Appointment-source context (doctor + meeting), fetched instead of the order
+  // context when the task's entity is an Appointment.
+  const [apptContext, setApptContext] = useState<AppointmentContext | null>(null);
+
+  // Is this an Appointments-source task? entityType is stamped at creation
+  // ("APPOINTMENT"); dataSource.sourceId is the fallback.
+  const isAppointment =
+    (task.entityType ?? "").toUpperCase() === "APPOINTMENT" ||
+    task.dataSource?.sourceId === "Appointments";
+
+  // Hydrate full task detail (checklistItems, history, etc.) and the entity
+  // context (order OR appointment, per source) in parallel.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [taskRes, orderRes] = await Promise.all([
+        const entityUrl = isAppointment
+          ? `/api/appointments/${task.entityId}`
+          : `/api/orders/${task.entityId}`;
+        const [taskRes, entityRes] = await Promise.all([
           fetch(`/api/tasks/${task.id}`),
-          fetch(`/api/orders/${task.entityId}`),
+          fetch(entityUrl),
         ]);
         if (!cancelled && taskRes.ok) {
           const data = await taskRes.json();
@@ -176,9 +214,11 @@ export default function TaskDetailPanel({ task, onUpdate }: TaskDetailPanelProps
             }));
           }
         }
-        if (!cancelled && orderRes.ok) {
-          const data = await orderRes.json();
-          if (data?.order) {
+        if (!cancelled && entityRes.ok) {
+          const data = await entityRes.json();
+          if (isAppointment && data?.appointment) {
+            setApptContext(data.appointment as AppointmentContext);
+          } else if (!isAppointment && data?.order) {
             setOrderContext({
               internalNotes: data.order.internalNotes ?? null,
               notes: data.order.notes ?? null,
@@ -190,11 +230,11 @@ export default function TaskDetailPanel({ task, onUpdate }: TaskDetailPanelProps
           }
         }
       } catch (e) {
-        console.error("[TaskDetailPanel] failed to fetch detail/order:", e);
+        console.error("[TaskDetailPanel] failed to fetch detail/entity:", e);
       }
     })();
     return () => { cancelled = true; };
-  }, [task.id, task.entityId]);
+  }, [task.id, task.entityId, isAppointment]);
 
   const meta = displayedTask.metadata;
   const actions = NEXT_STATUS[displayedTask.status] ?? [];
@@ -403,17 +443,23 @@ export default function TaskDetailPanel({ task, onUpdate }: TaskDetailPanelProps
       <div className="px-6 pt-5 pb-4 border-b border-zinc-800">
         <div className="flex items-start gap-3 mb-3">
           <div className="flex-1 min-w-0">
-            <h2 className="text-base font-semibold text-white leading-snug">{displayedTask.title}</h2>
+            <h2 className="text-base font-semibold text-white leading-snug">{titleToIST(displayedTask.title)}</h2>
             <div className="flex items-center gap-2 mt-1.5">
               <StatusBadge status={displayedTask.status} />
               <PriorityBadge priority={displayedTask.priority} size="sm" />
-              <button
-                onClick={() => setShowOrderView(true)}
-                className="text-xs text-blue-400 hover:text-blue-300 hover:underline transition-colors"
-                title="View order details"
-              >
-                Order #{displayedTask.entityId}
-              </button>
+              {isAppointment ? (
+                <span className="text-xs text-zinc-400" title="Appointment">
+                  Appointment #{displayedTask.entityId}
+                </span>
+              ) : (
+                <button
+                  onClick={() => setShowOrderView(true)}
+                  className="text-xs text-blue-400 hover:text-blue-300 hover:underline transition-colors"
+                  title="View order details"
+                >
+                  Order #{displayedTask.entityId}
+                </button>
+              )}
             </div>
           </div>
           {/* Flag for help */}
@@ -451,7 +497,60 @@ export default function TaskDetailPanel({ task, onUpdate }: TaskDetailPanelProps
       {/* Scrollable body */}
       <div className="flex-1 overflow-y-auto px-6 py-4 space-y-5">
 
+        {/* Appointment metadata — shown for Appointments-source tasks. Prefers
+            the live appointment fetch (doctor/meeting), falling back to the
+            task metadata for the fields available before it lands. */}
+        {isAppointment && (
+        <div>
+          <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Appointment Details</h3>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+            {[
+              { label: "Patient", value: apptContext?.patientName || (meta.patientName as string) || "—" },
+              {
+                label: "Appointment",
+                value: (apptContext?.appointmentDate ?? (meta.appointmentTime as string | undefined))
+                  ? formatISTTimestamp((apptContext?.appointmentDate ?? (meta.appointmentTime as string)), {
+                      dateStyle: "medium",
+                      timeStyle: "short",
+                    })
+                  : "—",
+              },
+              { label: "Type", value: (apptContext?.appointmentType || displayedTask.orderType || "—").replace(/_/g, " ") },
+              { label: "Status", value: apptContext?.appointmentStatus || (meta.orderStatus as string) || "—" },
+              { label: "Doctor", value: apptContext?.doctorName || "—" },
+              { label: "Doctor Contact", value: apptContext?.doctorMobile
+                  ? <span>{apptContext.doctorMobile} <CallButton to={apptContext.doctorMobile} name={apptContext.doctorName} taskId={displayedTask.id} triggeredFrom="appt-doctor" /></span>
+                  : "—" },
+              { label: "Store", value: apptContext?.storeName || "—" },
+              { label: "Reference", value: apptContext?.referenceId || "—" },
+              { label: "Patient Contact", value: apptContext?.patientMobile
+                  ? <span>{apptContext.patientMobile} <CallButton to={apptContext.patientMobile} name={apptContext.patientName} taskId={displayedTask.id} triggeredFrom="appt-patient" /></span>
+                  : "—" },
+            ].map(({ label, value }) => (
+              <div key={label}>
+                <div className="text-[10px] text-zinc-600 uppercase tracking-wider">{label}</div>
+                <div className="text-sm text-zinc-200 mt-0.5 break-words">{value}</div>
+              </div>
+            ))}
+          </div>
+          {apptContext?.appointmentUrl && (
+            <a
+              href={apptContext.appointmentUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 mt-3 text-xs text-blue-400 hover:text-blue-300 hover:underline"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+              </svg>
+              Join meeting
+            </a>
+          )}
+        </div>
+        )}
+
         {/* Order metadata */}
+        {!isAppointment && (
         <div>
           <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Order Details</h3>
           <div className="grid grid-cols-2 gap-x-4 gap-y-2">
@@ -461,7 +560,9 @@ export default function TaskDetailPanel({ task, onUpdate }: TaskDetailPanelProps
               { label: "Lab", value: (meta.labName as string) || "—" },
               { label: "Store", value: (meta.storeName as string) || "—" },
               { label: "Phlebo", value: (meta.phleboName as string) || "Not assigned" },
-              { label: "Phone", value: (meta.phleboNumber as string) || "—" },
+              { label: "Phone", value: (meta.phleboNumber as string)
+                  ? <span>{meta.phleboNumber as string} <CallButton to={meta.phleboNumber as string} name={(meta.phleboName as string) ?? null} taskId={displayedTask.id} triggeredFrom="order-phlebo" /></span>
+                  : "—" },
               {
                 label: "Appointment",
                 value: meta.appointmentTime
@@ -480,6 +581,7 @@ export default function TaskDetailPanel({ task, onUpdate }: TaskDetailPanelProps
             ))}
           </div>
         </div>
+        )}
 
         {/* Order context from labstack — patient/phlebo + internal notes.
             Agents need this to know what's already been tried (e.g. "Tried
@@ -518,6 +620,46 @@ export default function TaskDetailPanel({ task, onUpdate }: TaskDetailPanelProps
                   <div className="text-zinc-500 mb-1">Order notes</div>
                   <pre className="text-zinc-300 bg-zinc-900/50 rounded p-2 whitespace-pre-wrap font-sans text-[11px] leading-relaxed">
                     {orderContext.notes}
+                  </pre>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Appointment context — doctor + notes from labstack, the appointment
+            analogue of the order context above. */}
+        {apptContext && (apptContext.doctorName || apptContext.internalNotes || apptContext.notes) && (
+          <div className="border border-zinc-800 rounded-lg overflow-hidden">
+            <div className="px-3 py-2 bg-zinc-900/60 border-b border-zinc-800 flex items-center justify-between">
+              <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Appointment context</h3>
+              {apptContext.appointmentStatus && (
+                <span className="text-[10px] text-zinc-500">{apptContext.appointmentStatus}</span>
+              )}
+            </div>
+            <div className="p-3 space-y-2 text-xs">
+              {apptContext.doctorName && (
+                <div className="flex gap-2">
+                  <span className="text-zinc-500 w-16 shrink-0">Doctor</span>
+                  <span className="text-zinc-200">
+                    {apptContext.doctorName}
+                    {apptContext.doctorMobile ? ` · ${apptContext.doctorMobile}` : ""}
+                  </span>
+                </div>
+              )}
+              {apptContext.internalNotes && (
+                <div>
+                  <div className="text-zinc-500 mb-1">Internal notes</div>
+                  <pre className="text-zinc-300 bg-zinc-900/50 rounded p-2 whitespace-pre-wrap font-sans text-[11px] leading-relaxed">
+                    {apptContext.internalNotes}
+                  </pre>
+                </div>
+              )}
+              {apptContext.notes && (
+                <div>
+                  <div className="text-zinc-500 mb-1">Appointment notes</div>
+                  <pre className="text-zinc-300 bg-zinc-900/50 rounded p-2 whitespace-pre-wrap font-sans text-[11px] leading-relaxed">
+                    {apptContext.notes}
                   </pre>
                 </div>
               )}
@@ -566,36 +708,75 @@ export default function TaskDetailPanel({ task, onUpdate }: TaskDetailPanelProps
               />
             </div>
 
-            <div className="space-y-2">
+            <div className="space-y-3">
               {displayedTask.checklistItems.map((item) => (
-                <label
-                  key={item.id}
-                  className={`flex items-start gap-3 cursor-pointer group ${
-                    isTerminal ? "cursor-default" : ""
-                  }`}
-                >
-                  <div className="mt-0.5 shrink-0">
-                    <input
-                      type="checkbox"
-                      checked={item.isDone}
-                      disabled={isTerminal || loading === `check-${item.id}`}
-                      onChange={(e) => toggleChecklist(item.id, e.target.checked)}
-                      className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-green-500 focus:ring-green-500 focus:ring-offset-zinc-900 cursor-pointer"
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <span className={`text-sm leading-snug ${
-                      item.isDone ? "text-zinc-500 line-through" : "text-zinc-200"
-                    }`}>
-                      {item.stepText}
-                    </span>
-                    {item.isRequired && !item.isDone && (
-                      <span className="ml-1.5 text-[10px] text-red-400 font-medium">required</span>
-                    )}
-                  </div>
-                </label>
+                <div key={item.id}>
+                  <label
+                    className={`flex items-start gap-3 cursor-pointer group ${
+                      isTerminal ? "cursor-default" : ""
+                    }`}
+                  >
+                    <div className="mt-0.5 shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={item.isDone}
+                        disabled={isTerminal || loading === `check-${item.id}`}
+                        onChange={(e) => toggleChecklist(item.id, e.target.checked)}
+                        className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-green-500 focus:ring-green-500 focus:ring-offset-zinc-900 cursor-pointer"
+                      />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <span className={`text-sm leading-snug ${
+                        item.isDone ? "text-zinc-500 line-through" : "text-zinc-200"
+                      }`}>
+                        {item.stepText}
+                      </span>
+                      {item.isRequired && !item.isDone && (
+                        <span className="ml-1.5 text-[10px] text-red-400 font-medium">required</span>
+                      )}
+                    </div>
+                  </label>
+                  {/* Per-step guidance + script (agent how-to). Rendered outside
+                      the label so reading them doesn't toggle the checkbox. */}
+                  {(item.guidance || item.script) && (
+                    <div className="ml-7 mt-1 space-y-1.5">
+                      {item.guidance && (
+                        <div className="text-[11px] leading-relaxed text-zinc-400">
+                          <span className="text-zinc-600">Guidance: </span>
+                          <span className="whitespace-pre-wrap">{item.guidance}</span>
+                        </div>
+                      )}
+                      {item.script && (
+                        <div className="text-[11px] leading-relaxed text-zinc-300 bg-zinc-800/60 border-l-2 border-blue-700/50 rounded-r px-2 py-1.5">
+                          <span className="text-zinc-500 block text-[10px] uppercase tracking-wider mb-0.5">Script</span>
+                          <span className="whitespace-pre-wrap italic">{item.script}</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
               ))}
             </div>
+
+            {/* Next step — from the task's snapshotted guidance, chosen by
+                whether the required items are all done. */}
+            {(() => {
+              const ns = (displayedTask.metadata?.nextStep ?? null) as { complete?: string | null; incomplete?: string | null } | null;
+              if (!ns) return null;
+              const requiredDone = displayedTask.checklistItems.every((i) => !i.isRequired || i.isDone);
+              const text = requiredDone ? ns.complete : ns.incomplete;
+              if (!text) return null;
+              return (
+                <div className={`mt-4 rounded-lg border px-3 py-2.5 ${
+                  requiredDone ? "border-emerald-700/40 bg-emerald-500/5" : "border-amber-700/40 bg-amber-500/5"
+                }`}>
+                  <div className={`text-[10px] uppercase tracking-wider mb-1 ${requiredDone ? "text-emerald-400" : "text-amber-400"}`}>
+                    Next step {requiredDone ? "· checklist complete" : "· checklist incomplete"}
+                  </div>
+                  <div className="text-xs text-zinc-200 leading-relaxed whitespace-pre-wrap">{text}</div>
+                </div>
+              );
+            })()}
           </div>
         )}
 

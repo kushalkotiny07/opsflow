@@ -43,12 +43,12 @@ export async function GET(
   const [taskType, items, ruleCount] = await Promise.all([
     prisma.taskType.findUnique({
       where: { id: taskTypeId },
-      select: { id: true, name: true, label: true },
+      select: { id: true, name: true, label: true, nextStepComplete: true, nextStepIncomplete: true },
     }),
     prisma.checklistTemplate.findMany({
       where: { taskTypeId },
       orderBy: { stepOrder: "asc" },
-      select: { id: true, stepOrder: true, stepText: true, isRequired: true },
+      select: { id: true, stepOrder: true, stepText: true, isRequired: true, guidance: true, script: true },
     }),
     prisma.taskRule.count({ where: { taskTypeId, isActive: true } }),
   ]);
@@ -64,6 +64,15 @@ interface ChecklistInput {
   stepText: string;
   isRequired?: boolean;
   stepOrder?: number;
+  guidance?: string | null;
+  script?: string | null;
+}
+
+// Trim to a string or null (blank → null so the DB column stays clean).
+function trimOrNull(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t.length > 0 ? t : null;
 }
 
 export async function PUT(
@@ -80,7 +89,7 @@ export async function PUT(
     return NextResponse.json({ error: "Invalid task type id" }, { status: 400 });
   }
 
-  let body: { items?: ChecklistInput[] };
+  let body: { items?: ChecklistInput[]; nextStepComplete?: string | null; nextStepIncomplete?: string | null };
   try {
     body = await req.json();
   } catch {
@@ -99,6 +108,8 @@ export async function PUT(
       stepText: typeof it.stepText === "string" ? it.stepText.trim() : "",
       isRequired: it.isRequired !== false,
       stepOrder: typeof it.stepOrder === "number" ? it.stepOrder : idx,
+      guidance: trimOrNull(it.guidance),
+      script: trimOrNull(it.script),
     }))
     .filter((it) => it.stepText.length > 0)
     .map((it, idx) => ({ ...it, stepOrder: idx })); // re-sequence 0..N-1
@@ -124,14 +135,31 @@ export async function PUT(
         stepText: it.stepText,
         isRequired: it.isRequired,
         stepOrder: it.stepOrder,
+        guidance: it.guidance,
+        script: it.script,
       })),
+    }),
+    // Task-level next-step guidance lives on the task type (copied onto each
+    // task at creation). Only touch it when the client sent the keys.
+    prisma.taskType.update({
+      where: { id: taskTypeId },
+      data: {
+        ...("nextStepComplete" in body ? { nextStepComplete: trimOrNull(body.nextStepComplete) } : {}),
+        ...("nextStepIncomplete" in body ? { nextStepIncomplete: trimOrNull(body.nextStepIncomplete) } : {}),
+      },
     }),
   ]);
 
-  const fresh = await prisma.checklistTemplate.findMany({
-    where: { taskTypeId },
-    orderBy: { stepOrder: "asc" },
-    select: { id: true, stepOrder: true, stepText: true, isRequired: true },
-  });
-  return NextResponse.json({ items: fresh });
+  const [fresh, tt] = await Promise.all([
+    prisma.checklistTemplate.findMany({
+      where: { taskTypeId },
+      orderBy: { stepOrder: "asc" },
+      select: { id: true, stepOrder: true, stepText: true, isRequired: true, guidance: true, script: true },
+    }),
+    prisma.taskType.findUnique({
+      where: { id: taskTypeId },
+      select: { nextStepComplete: true, nextStepIncomplete: true },
+    }),
+  ]);
+  return NextResponse.json({ items: fresh, nextStepComplete: tt?.nextStepComplete ?? null, nextStepIncomplete: tt?.nextStepIncomplete ?? null });
 }

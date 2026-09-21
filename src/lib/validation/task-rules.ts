@@ -20,8 +20,8 @@
 
 import { z } from "zod";
 import { TaskPriority } from "@prisma/client";
-import { LabstackOrderStatus } from "@/types";
 import prisma from "@/lib/db/client";
+import { introspectColumnValues, tableNameFromReference } from "@/lib/data-sources/column-enums";
 
 // ── Tunable bounds ──────────────────────────────────────────────────────────
 export const SLA_MINUTES_MIN = 1;
@@ -113,9 +113,22 @@ export interface StatusValidationResult {
 /**
  * Validate that every status in `statusIn` is one the data source actually emits.
  *
- * The source carries a `statusFieldEnumValues` jsonb column populated when
- * the source was registered. If it's empty (legacy sources), we fall back to
- * the LabstackOrderStatus enum so existing rules don't suddenly fail.
+ * Resolution order for the "valid values" set:
+ *   1. The source's stored `statusFieldEnumValues` (captured at registration).
+ *   2. Live introspection of the source's status column on the LABSTACK
+ *      replica — the SAME query the rule builder's status dropdown uses, so
+ *      the UI's offered values and the server's accepted values never drift.
+ *
+ * We deliberately do NOT fall back to a hardcoded `LabstackOrderStatus` list:
+ * that list was stale (it invented SAMPLE_IN_TRANSIT / REPORT_READY and omitted
+ * PENDING / CREATED / SAMPLE_PROCESSED), so a null-enum source — e.g. every
+ * source registered before enum capture, or any non-order source like
+ * Appointments / PharmaOrder — would wrongly reject perfectly valid statuses.
+ *
+ * If neither the stored enum nor live introspection yields any values (replica
+ * down, unusual column type), we pass rather than block the save: the poller
+ * simply won't match a status the source never emits, so a permissive save is
+ * safer than a false rejection.
  */
 export async function validateStatusesAgainstSource(
   dataSourceId: string,
@@ -123,15 +136,28 @@ export async function validateStatusesAgainstSource(
 ): Promise<StatusValidationResult> {
   const ds = await prisma.dataSource.findUnique({
     where: { id: dataSourceId },
-    select: { statusFieldEnumValues: true },
+    select: { statusFieldEnumValues: true, tableReference: true, statusFieldName: true },
   });
 
   if (!ds) return { valid: false, invalidStatuses: statusIn };
 
   const enumValues = ds.statusFieldEnumValues as unknown;
-  const sourceStatuses = Array.isArray(enumValues) && enumValues.length > 0
-    ? (enumValues as unknown[]).filter((v): v is string => typeof v === "string")
-    : Object.values(LabstackOrderStatus);
+  let sourceStatuses: string[] =
+    Array.isArray(enumValues) && enumValues.length > 0
+      ? (enumValues as unknown[]).filter((v): v is string => typeof v === "string")
+      : [];
+
+  // No stored enum → introspect the live column so newly-registered / non-order
+  // sources validate against their real statuses instead of a stale order list.
+  if (sourceStatuses.length === 0) {
+    sourceStatuses = await introspectColumnValues(
+      tableNameFromReference(ds.tableReference),
+      ds.statusFieldName,
+    );
+  }
+
+  // Still nothing knowable → don't block the save (see doc comment).
+  if (sourceStatuses.length === 0) return { valid: true };
 
   const validSet = new Set(sourceStatuses);
   const invalid = statusIn.filter((s) => !validSet.has(s));
